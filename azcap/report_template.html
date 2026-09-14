@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Azure Region Saturation</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface: #fcfcfb; --panel: #ffffff; --line: #e4e3df;
+    --text: #0b0b0b; --text-2: #52514e; --text-3: #8a8985;
+    --seq-0: #f3f3f1; --seq-1: #cde2fb; --seq-2: #9ec5f4; --seq-3: #6da7ec;
+    --seq-4: #3987e5; --seq-5: #256abf; --seq-6: #184f95; --seq-7: #0d366b;
+    --accent: #2a78d6; --tip-bg: #0b0b0b; --tip-fg: #fff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --surface: #1a1a19; --panel: #222220; --line: #3a3a37;
+      --text: #ffffff; --text-2: #c3c2b7; --text-3: #8a8985;
+      --seq-0: #262624; --seq-1: #0d366b; --seq-2: #104281; --seq-3: #184f95;
+      --seq-4: #256abf; --seq-5: #3987e5; --seq-6: #6da7ec; --seq-7: #9ec5f4;
+      --accent: #3987e5; --tip-bg: #fff; --tip-fg: #0b0b0b;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface: #1a1a19; --panel: #222220; --line: #3a3a37;
+    --text: #ffffff; --text-2: #c3c2b7; --text-3: #8a8985;
+    --seq-0: #262624; --seq-1: #0d366b; --seq-2: #104281; --seq-3: #184f95;
+    --seq-4: #256abf; --seq-5: #3987e5; --seq-6: #6da7ec; --seq-7: #9ec5f4;
+    --accent: #3987e5; --tip-bg: #fff; --tip-fg: #0b0b0b;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--surface); color: var(--text);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width: 1240px; margin: 0 auto; padding-block: 28px 48px; padding-inline: 20px; }
+  h1 { font-size: 22px; font-weight: 600; margin: 0 0 4px; }
+  h2 { font-size: 15px; font-weight: 600; margin: 32px 0 10px; }
+  .meta { color: var(--text-2); font-size: 13px; }
+  .meta code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+  .note { color: var(--text-2); font-size: 13px; margin: 6px 0 12px; max-width: 78ch; }
+  .tiles { display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0 6px; }
+  .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+          padding: 10px 14px; min-width: 150px; flex: 1 1 150px; }
+  .tile .k { color: var(--text-2); font-size: 12px; }
+  .tile .v { font-size: 24px; font-weight: 600; line-height: 1.2; margin-top: 2px; }
+  .tile .s { color: var(--text-3); font-size: 12px; margin-top: 2px; }
+  .scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+  table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 13px; }
+  th, td { padding: 6px 10px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--line); }
+  th { color: var(--text-2); font-weight: 500; font-size: 12px; position: sticky; top: 0; background: var(--panel); }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  /* heatmap */
+  .heat td.cell { padding: 0; }
+  .heat .c { display: block; margin: 2px; height: 34px; min-width: 64px; border-radius: 4px;
+             display: flex; align-items: center; justify-content: center;
+             font-variant-numeric: tabular-nums; font-size: 12px; cursor: default; }
+  .heat .c.empty { background: transparent; color: var(--text-3); }
+  .heat th.rowh { font-weight: 600; color: var(--text); }
+  .heat th.rowh .rs { color: var(--text-2); font-weight: 400; margin-left: 6px; }
+  .legend { display: flex; align-items: center; gap: 6px; margin: 10px 0 0; color: var(--text-2); font-size: 12px; }
+  .legend .sw { width: 22px; height: 12px; border-radius: 3px; display: inline-block; }
+  .pill { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; }
+  .pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; border: 2px solid currentColor; }
+  .pill.available { color: var(--text-2); }
+  .pill.available::before { border-color: var(--text-3); }
+  .pill.zone_restricted::before { background: var(--text-2); border-color: var(--text-2); clip-path: inset(0 50% 0 0); }
+  .pill.region_restricted::before { background: var(--text); border-color: var(--text); }
+  .pill.quota_blocked::before { border-style: dashed; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 10px; }
+  .controls input, .controls select { font: inherit; padding: 5px 8px; border: 1px solid var(--line);
+                                       border-radius: 6px; background: var(--panel); color: var(--text); }
+  .tip { position: fixed; pointer-events: none; background: var(--tip-bg); color: var(--tip-fg);
+         padding: 8px 10px; border-radius: 6px; font-size: 12px; line-height: 1.4; z-index: 10;
+         max-width: 320px; box-shadow: 0 2px 10px rgba(0,0,0,.2); }
+  .tip b { font-weight: 600; }
+  .tip[hidden] { display: none; }
+  .warn { color: var(--text-2); font-size: 13px; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Azure region saturation — VM SKUs</h1>
+  <div class="meta" id="meta"></div>
+  <p class="note">Every number in this report is a <b>percentage of VM SKUs withheld</b> from <em>this subscription</em>:
+    0 = every SKU is allocatable, 100 = none are. A region-restricted SKU counts as fully withheld; a zone-restricted SKU counts
+    as the fraction of its zones blocked (1 of 3 zones = 0.33). The region figure is the SKU-weighted average across all
+    families scanned, so a region at 4.2 has 4.2% of its SKU surface withheld. Quota-blocked SKUs (family has zero quota) are a subscription signal, not capacity, and are
+    scored separately. Subscription-specific: results can differ from the customer's tenant.</p>
+
+  <div class="tiles" id="tiles"></div>
+
+  <h2>Saturation by region × family</h2>
+  <div class="controls">
+    <label class="warn"><input type="checkbox" id="hideZero" checked> hide families with no restrictions anywhere</label>
+    <span class="warn" id="heatCount"></span>
+  </div>
+  <div class="scroll"><table class="heat" id="heat"></table></div>
+  <div class="legend" id="legend"></div>
+
+  <div id="pairsBlock" hidden>
+    <h2>Paired regions</h2>
+    <p class="note">Each requested region against its Microsoft-designated pair (from the Subscriptions API). "Both constrained"
+      lists families with ≥ 50% of SKUs withheld on both sides — no DR headroom for that family. Cross-geography pairs and pairs without
+      availability zones are flagged because they matter for residency and for zone-resilient DR designs. Regions with no pair
+      are newer regions Microsoft launched unpaired; DR there is a region you choose, not a pair.</p>
+    <div class="scroll"><table id="pairs"></table></div>
+    <div id="pairFam"></div>
+  </div>
+
+  <h2>Zone pressure</h2>
+  <p class="note">Number of SKUs with a zone-scoped restriction in each availability zone. Uneven counts across zones in a
+    region are the early warning before region-level restriction.</p>
+  <div class="scroll"><table id="zones"></table></div>
+
+  <div id="quotaBlock" hidden>
+    <h2>Quota headroom</h2>
+    <p class="note">Compute vCPU quota per family (current use vs. limit). A 0 limit means the family is not provisioned for this
+      subscription — request quota; a rejected or held request in a region is itself a capacity signal.</p>
+    <div class="scroll"><table id="quota"></table></div>
+  </div>
+
+  <div id="changesBlock" hidden>
+    <h2>Changes since baseline</h2>
+    <div class="scroll"><table id="changes"></table></div>
+  </div>
+
+  <h2>SKU detail</h2>
+  <div class="controls">
+    <input id="q" placeholder="filter SKU / family…" size="28">
+    <select id="fReg"><option value="">all regions</option></select>
+    <select id="fStat">
+      <option value="">all statuses</option>
+      <option value="region_restricted">region restricted</option>
+      <option value="zone_restricted">zone restricted</option>
+      <option value="quota_blocked">quota blocked</option>
+      <option value="available">available</option>
+    </select>
+    <span class="warn" id="count"></span>
+  </div>
+  <div class="scroll"><table id="skus"></table></div>
+</div>
+<div class="tip" id="tip" hidden></div>
+
+<script>
+const DATA = /*__DATA__*/null;
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const STATUS_LABEL = { available: "available", zone_restricted: "zone restricted",
+                       region_restricted: "region restricted", quota_blocked: "quota blocked" };
+
+function seqVar(score) {
+  if (score <= 0) return "var(--seq-0)";
+  const step = Math.min(7, 1 + Math.floor(score / 14.3));
+  return `var(--seq-${step})`;
+}
+function seqInk(score) {
+  // light mode: steps >=4 are dark enough for white ink; dark mode: inverse. Use a mid cut and rely on tabular labels.
+  const dark = matchMedia("(prefers-color-scheme: dark)").matches && document.documentElement.dataset.theme !== "light"
+            || document.documentElement.dataset.theme === "dark";
+  if (score <= 0) return "var(--text-2)";
+  const step = Math.min(7, 1 + Math.floor(score / 14.3));
+  return dark ? (step >= 6 ? "#0b0b0b" : "#ffffff") : (step >= 4 ? "#ffffff" : "#0b0b0b");
+}
+
+// ---- meta + tiles
+(function () {
+  const m = DATA.meta;
+  $("#meta").innerHTML = `Generated ${esc(m.generated)}` +
+    (m.tenant_id ? ` · tenant <code>${esc(m.tenant_id)}</code>` : "") +
+    ` · subscription ${m.subscription_name ? esc(m.subscription_name) + " " : ""}<code>${esc(m.subscription)}</code>` +
+    ` · regions <code>${esc(m.regions.join(", "))}</code>` +
+    (m.families?.length ? ` · families <code>${esc(m.families.join(", "))}</code>` : "") +
+    (m.sku_glob ? ` · sku <code>${esc(m.sku_glob)}</code>` : "") +
+    (m.exclude_families?.length ? ` · excluding <code>${esc(m.exclude_families.join(", "))}</code>` : "") +
+    (m.zonal_only ? ` · <b>zonal SKUs only</b>` : "") +
+    (m.not_visible?.length ? `<br><b>Not visible to this subscription (skipped):</b> <code>${esc(m.not_visible.join(", "))}</code> — region not enabled for this subscription or misspelled` : "");
+  const skus = DATA.skus;
+  const by = k => skus.filter(s => s.status === k).length;
+  const worst = Object.entries(DATA.regionScores).sort((a,b)=>b[1]-a[1])[0];
+  const tiles = [
+    ["VM SKUs scanned", skus.length, `${m.regions.length} region(s)`],
+    ["Region-restricted", by("region_restricted"), "NotAvailableForSubscription @ Location"],
+    ["Zone-restricted", by("zone_restricted"), "NotAvailableForSubscription @ Zone"],
+    ["Quota-blocked", by("quota_blocked"), "QuotaId — not a capacity signal"],
+    ["Most withheld region", worst ? worst[0] : "—", worst ? `${worst[1]}% of SKUs withheld` : ""],
+  ];
+  $("#tiles").innerHTML = tiles.map(([k,v,s]) => `<div class="tile"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div><div class="s">${esc(s)}</div></div>`).join("");
+})();
+
+// ---- heatmap
+(function () {
+  const regions = DATA.meta.regions;
+  const idx = {}; DATA.summary.forEach(s => idx[s.region + "|" + s.family] = s);
+  const maxBy = {}; DATA.summary.forEach(s => maxBy[s.family] = Math.max(maxBy[s.family] ?? 0, s.score));
+  const allFams = Object.keys(maxBy).sort((a,b) => (maxBy[b]-maxBy[a]) || a.localeCompare(b, undefined, {numeric:true}));
+  function render() {
+  const hide = $("#hideZero").checked;
+  const fams = hide ? allFams.filter(f => maxBy[f] > 0) : allFams;
+  $("#heatCount").textContent = `${fams.length} of ${allFams.length} families · sorted by worst score`;
+  let h = `<thead><tr><th>region · % withheld</th>${fams.map(f => `<th class="num">${esc(f)}</th>`).join("")}</tr></thead><tbody>`;
+  for (const r of regions) {
+    const pairOf = DATA.meta.pair_of?.[r];
+    h += `<tr><th class="rowh">${pairOf ? "↳ " : ""}${esc(r)}<span class="rs">${DATA.regionScores[r] != null ? esc(DATA.regionScores[r]) + "% withheld" : "—"}${pairOf ? ` · pair of ${esc(pairOf)}` : ""}</span></th>`;
+    for (const f of fams) {
+      const s = idx[r + "|" + f];
+      if (!s) { h += `<td class="cell"><span class="c empty">·</span></td>`; continue; }
+      h += `<td class="cell"><span class="c" data-key="${esc(r + "|" + f)}" style="background:${seqVar(s.score)};color:${seqInk(s.score)}">${s.score.toFixed(0)}</span></td>`;
+    }
+    h += `</tr>`;
+  }
+  $("#heat").innerHTML = h + "</tbody>";
+  }
+  $("#hideZero").addEventListener("change", render);
+  render();
+  $("#legend").innerHTML = `0% withheld ` + [0,10,25,40,55,70,85,100].map(v => `<span class="sw" style="background:${seqVar(v)}"></span>`).join("") + ` 100% withheld · cell = % of that family's SKUs withheld in that region · row label = SKU-weighted average across all families`;
+
+  const tip = $("#tip");
+  $("#heat").addEventListener("mousemove", e => {
+    const c = e.target.closest(".c[data-key]");
+    if (!c) { tip.hidden = true; return; }
+    const s = idx[c.dataset.key];
+    tip.innerHTML = `<b>${esc(s.region)} · ${esc(s.family)}</b><br>${s.score}% of SKUs withheld<br>` +
+      `${s.n_skus} SKUs: ${s.n_available} available, ${s.n_zone_restricted} zone-restricted, ` +
+      `${s.n_region_restricted} region-restricted, ${s.n_quota_blocked} quota-blocked<br>` +
+      `zone slots blocked ${s.zone_slots_blocked}/${s.zone_slots_total}`;
+    tip.hidden = false;
+    const x = Math.min(e.clientX + 14, innerWidth - 340), y = Math.min(e.clientY + 14, innerHeight - 110);
+    tip.style.left = x + "px"; tip.style.top = y + "px";
+  });
+  $("#heat").addEventListener("mouseleave", () => tip.hidden = true);
+})();
+
+// ---- paired regions
+(function () {
+  const P = DATA.pairs || [];
+  if (!P.length) return;
+  $("#pairsBlock").hidden = false;
+  const fmt = v => v == null ? "—" : Number(v).toFixed(1);
+  const cell = v => v == null ? `<td class="num">—</td>` :
+    `<td class="num" style="background:${seqVar(v)};color:${seqInk(v)}">${fmt(v)}</td>`;
+  let h = `<thead><tr><th>region</th><th>geography</th><th>zones</th><th class="num">% withheld</th>
+           <th>paired region</th><th>pair geography</th><th>pair zones</th><th class="num">pair % withheld</th><th>flags</th></tr></thead><tbody>`;
+  for (const p of P) {
+    const flags = [];
+    if (!p.pair) flags.push("no paired region");
+    else {
+      if (p.same_geography === false) flags.push("cross-geography pair");
+      if (p.pair_zonal === false) flags.push("pair has no availability zones");
+      if (p.pair_has_data === false) flags.push("no SKUs evaluated in pair (filtered out)");
+      if (p.both_constrained.length) flags.push("both constrained: " + p.both_constrained.join(", "));
+    }
+    h += `<tr><th class="rowh">${esc(p.region)}</th><td>${esc(p.geography ?? "")}</td><td>${p.zonal ? "yes" : "no"}</td>${cell(p.score)}` +
+         `<td>${esc(p.pair ?? "—")}</td><td>${esc(p.pair_geography ?? "")}</td><td>${p.pair ? (p.pair_zonal ? "yes" : "no") : ""}</td>${cell(p.pair_score)}` +
+         `<td class="warn" style="white-space:normal;min-width:220px">${esc(flags.join(" · ")) || "&nbsp;"}</td></tr>`;
+  }
+  $("#pairs").innerHTML = h + "</tbody>";
+
+  // per-family primary vs pair, one compact table per paired region
+  let f = "";
+  for (const p of P) {
+    if (!p.pair || !p.per_family.length || p.pair_has_data === false) continue;
+    f += `<h2 style="font-size:13px;margin:16px 0 6px">${esc(p.region)} vs ${esc(p.pair)} — by family</h2>
+          <div class="scroll"><table><thead><tr><th>family</th><th class="num">${esc(p.region)}</th><th class="num">${esc(p.pair)}</th><th class="num">worse side</th></tr></thead><tbody>`;
+    for (const r of p.per_family) {
+      const worse = r.pair_missing ? "pair lacks family" : (r.primary ?? 0) === (r.pair ?? 0) ? "even" : ((r.primary ?? 0) > (r.pair ?? 0) ? p.region : p.pair);
+      f += `<tr><td>${esc(r.family)}</td>${cell(r.primary)}${r.pair_missing ? `<td class="num warn">not offered</td>` : cell(r.pair)}<td class="num warn">${esc(worse)}</td></tr>`;
+    }
+    f += `</tbody></table></div>`;
+  }
+  $("#pairFam").innerHTML = f;
+})();
+
+// ---- zone pressure
+(function () {
+  const regions = DATA.meta.regions;
+  const zones = [...new Set(DATA.skus.flatMap(s => [...s.zones_available, ...s.zones_blocked]))].sort();
+  let h = `<thead><tr><th>region</th><th class="num">zonal SKUs</th>${zones.map(z => `<th class="num">zone ${esc(z)} blocked</th>`).join("")}<th class="num">non-zonal region</th></tr></thead><tbody>`;
+  for (const r of regions) {
+    const rows = DATA.skus.filter(s => s.region === r);
+    const zonal = rows.filter(s => s.zones_total > 0).length;
+    h += `<tr><th class="rowh">${esc(r)}</th><td class="num">${zonal}</td>`;
+    for (const z of zones) {
+      const n = rows.filter(s => s.zones_blocked.includes(z)).length;
+      const pct = zonal ? Math.round(100 * n / zonal) : 0;
+      h += `<td class="num" style="background:${seqVar(pct)};color:${seqInk(pct)}">${n}${zonal ? ` <span style="opacity:.75">(${pct}%)</span>` : ""}</td>`;
+    }
+    h += `<td class="num">${zonal ? "" : "no zones"}</td></tr>`;
+  }
+  $("#zones").innerHTML = h + "</tbody>";
+})();
+
+// ---- quota
+(function () {
+  if (!DATA.quota.length) return;
+  $("#quotaBlock").hidden = false;
+  const rows = [...DATA.quota].sort((a,b) => a.region.localeCompare(b.region) || a.family.localeCompare(b.family, undefined, {numeric:true}));
+  let h = `<thead><tr><th>region</th><th>family</th><th class="num">used vCPU</th><th class="num">limit</th><th class="num">headroom</th></tr></thead><tbody>`;
+  for (const q of rows) {
+    const hr = q.headroom_pct == null ? "no quota" : q.headroom_pct + "%";
+    const pressure = q.headroom_pct == null ? 100 : Math.max(0, 100 - q.headroom_pct);
+    h += `<tr><td>${esc(q.region)}</td><td>${esc(q.family)}</td><td class="num">${q.current}</td><td class="num">${q.limit}</td>` +
+         `<td class="num" style="background:${seqVar(pressure)};color:${seqInk(pressure)}">${hr}</td></tr>`;
+  }
+  $("#quota").innerHTML = h + "</tbody>";
+})();
+
+// ---- changes
+(function () {
+  if (!DATA.changes.length) return;
+  $("#changesBlock").hidden = false;
+  $("#changes").innerHTML = `<thead><tr><th>region</th><th>sku</th><th>from</th><th>to</th></tr></thead><tbody>` +
+    DATA.changes.map(c => `<tr><td>${esc(c.region)}</td><td>${esc(c.sku)}</td><td>${esc(c.from)}</td><td>${esc(c.to)}</td></tr>`).join("") + "</tbody>";
+})();
+
+// ---- sku table
+(function () {
+  const sel = $("#fReg");
+  DATA.meta.regions.forEach(r => sel.insertAdjacentHTML("beforeend", `<option>${esc(r)}</option>`));
+  function render() {
+    const q = $("#q").value.toLowerCase(), reg = sel.value, st = $("#fStat").value;
+    const rows = DATA.skus.filter(s => (!reg || s.region === reg) && (!st || s.status === st) &&
+      (!q || s.sku.toLowerCase().includes(q) || s.family.toLowerCase().includes(q)));
+    const order = { region_restricted: 0, zone_restricted: 1, quota_blocked: 2, available: 3 };
+    rows.sort((a,b) => order[a.status]-order[b.status] || a.region.localeCompare(b.region) || a.sku.localeCompare(b.sku, undefined, {numeric:true}));
+    $("#count").textContent = `${rows.length} of ${DATA.skus.length}`;
+    $("#skus").innerHTML = `<thead><tr><th>region</th><th>sku</th><th>family</th><th class="num">vCPU</th><th class="num">GiB</th><th>status</th><th>zones ok</th><th>zones blocked</th><th>reason</th></tr></thead><tbody>` +
+      rows.slice(0, 2000).map(s => `<tr><td>${esc(s.region)}</td><td>${esc(s.sku)}</td><td>${esc(s.family)}</td><td class="num">${s.vcpus ?? ""}</td><td class="num">${s.memory_gb ?? ""}</td>` +
+        `<td><span class="pill ${s.status}">${STATUS_LABEL[s.status]}</span></td><td>${esc(s.zones_available.join(" "))}</td><td>${esc(s.zones_blocked.join(" "))}</td><td>${esc(s.reason_codes.join(" "))}</td></tr>`).join("") +
+      "</tbody>" + (rows.length > 2000 ? `<tfoot><tr><td colspan="9" class="warn">showing first 2000 — narrow the filter or use skus.csv</td></tr></tfoot>` : "");
+  }
+  ["#q","#fReg","#fStat"].forEach(s => $(s).addEventListener("input", render));
+  render();
+})();
+</script>
+</body>
+</html>

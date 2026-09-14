@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "azcap"
+version = "0.1.0"
+description = "Azure region saturation scanner for VM SKUs — % of SKUs withheld per region, family, zone, and paired region"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Steve Ross" }]
+keywords = ["azure", "capacity", "vm", "sku", "availability-zones", "region-pairs"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: System :: Systems Administration",
+]
+dependencies = [
+  "azure-identity>=1.17",
+  "azure-mgmt-compute>=30",
+  "azure-mgmt-resource-subscriptions>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/steverlabs/azcap"
+Issues = "https://github.com/steverlabs/azcap/issues"
+
+[project.scripts]
+azcap = "azcap:main"
+
+[tool.setuptools]
+packages = ["azcap"]
+
+[tool.setuptools.package-data]
+azcap = ["report_template.html"]

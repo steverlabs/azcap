@@ -1,0 +1,690 @@
+#!/usr/bin/env python3
+"""
+azcap — Azure region saturation scanner for VM SKUs.
+
+Reads the Resource SKUs API (the same data behind `az vm list-skus`) and,
+optionally, compute quota usage, then scores each region x VM family by how
+much of the SKU surface Microsoft is currently withholding from this
+subscription. Produces CSVs and a self-contained HTML heatmap report.
+
+What the signals mean
+---------------------
+  region_restricted  NotAvailableForSubscription at Location scope. The SKU
+                     is defined in the region but Microsoft will not allocate
+                     it to this subscription there. Strongest saturation signal.
+  zone_restricted    NotAvailableForSubscription at Zone scope. SKU is
+                     allocatable in some zones only. Common in constrained
+                     regions before region-level restriction kicks in.
+  quota_blocked      QuotaId restriction — the family has zero quota for the
+                     subscription. That is a quota/subscription-type signal,
+                     not capacity, so it is tracked separately and excluded
+                     from the saturation score.
+  available          No restrictions.
+
+Saturation score (0-100) per region x family
+--------------------------------------------
+  For each SKU: loss = 1.0 if region_restricted
+                     = blocked_zones / total_zones if zone_restricted
+                     = 0 otherwise
+  score = 100 * mean(loss) over SKUs in the family (quota_blocked excluded).
+
+All data is subscription-specific. Run it under the subscription that will
+actually deploy, not a sandbox.
+
+Usage
+-----
+  python azcap.py --regions eastus,eastus2,canadacentral --families Dv5,Ev5,NC
+  python azcap.py --regions saudiarabiaeast --include-quota --out ./out
+  python azcap.py --regions eastus --fixture fixtures/sample.json   # offline
+  python azcap.py --regions eastus --compare out/previous/raw.json  # diff
+
+Auth: DefaultAzureCredential (az login, env vars, managed identity, etc.).
+Subscription: --subscription, else AZURE_SUBSCRIPTION_ID, else `az account show`.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import fnmatch
+import json
+import os
+import shutil
+import subprocess
+import sys
+from collections import defaultdict
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+# --------------------------------------------------------------------------- #
+# Data model
+# --------------------------------------------------------------------------- #
+
+@dataclass
+class SkuRow:
+    region: str
+    sku: str
+    family: str
+    vcpus: int | None
+    memory_gb: float | None
+    zones_total: int
+    zones_available: list[str]
+    zones_blocked: list[str]
+    status: str                # available | zone_restricted | region_restricted | quota_blocked
+    reason_codes: list[str]
+    loss: float                # 0..1 capacity loss used in scoring
+
+@dataclass
+class QuotaRow:
+    region: str
+    family: str
+    localized: str
+    current: int
+    limit: int
+
+    @property
+    def headroom_pct(self) -> float | None:
+        return None if self.limit == 0 else round(100 * (self.limit - self.current) / self.limit, 1)
+
+@dataclass
+class FamilySummary:
+    region: str
+    family: str
+    n_skus: int
+    n_available: int
+    n_zone_restricted: int
+    n_region_restricted: int
+    n_quota_blocked: int
+    score: float               # 0..100
+    zone_slots_total: int
+    zone_slots_blocked: int
+
+# --------------------------------------------------------------------------- #
+# Collection
+# --------------------------------------------------------------------------- #
+
+def resolve_subscription(explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    env = os.environ.get("AZURE_SUBSCRIPTION_ID")
+    if env:
+        return env
+    az = shutil.which("az") or shutil.which("az.cmd")   # Windows installs az.cmd
+    if not az:
+        sys.exit("Azure CLI not found on PATH: pass --subscription or set AZURE_SUBSCRIPTION_ID.")
+    try:
+        out = subprocess.check_output([az, "account", "show", "--query", "id", "-o", "tsv"], text=True)
+        return out.strip()
+    except Exception:
+        sys.exit("No subscription: pass --subscription or set AZURE_SUBSCRIPTION_ID or `az login`.")
+
+
+def make_credential(tenant: str | None):
+    """DefaultAzureCredential, pinned to a tenant when one is given so multi-tenant
+    CLI logins (SII vs. customer) can't silently pick the wrong directory."""
+    from azure.identity import AzureCliCredential, ChainedTokenCredential, DefaultAzureCredential
+    if tenant:
+        # Prefer a CLI token minted for that tenant; fall back to the default chain if the CLI isn't logged in.
+        return ChainedTokenCredential(
+            AzureCliCredential(tenant_id=tenant),
+            DefaultAzureCredential(additionally_allowed_tenants=[tenant]),
+        )
+    return DefaultAzureCredential()
+
+
+def describe_subscription(credential, subscription: str, tenant: str | None) -> dict:
+    """Subscription display name + owning tenant, so the report is stamped with where it ran."""
+    from azure.mgmt.resource.subscriptions import SubscriptionClient
+    sub = SubscriptionClient(credential).subscriptions.get(subscription)
+    info = {"subscription_name": sub.display_name, "tenant_id": (sub.tenant_id or "").lower()}
+    if tenant and info["tenant_id"] and info["tenant_id"] != tenant.lower():
+        sys.exit(f"Subscription {subscription} belongs to tenant {info['tenant_id']}, not --tenant {tenant}. "
+                 f"Check `az account list -o table`.")
+    return info
+
+
+def fetch_skus_live(credential, subscription: str, regions: list[str]) -> list[dict]:
+    from azure.mgmt.compute import ComputeManagementClient
+
+    client = ComputeManagementClient(credential, subscription)
+    raw: list[dict] = []
+    for region in regions:
+        # includeExtendedLocations not needed; filter server-side by location
+        for sku in client.resource_skus.list(filter=f"location eq '{region}'"):
+            if (sku.resource_type or "").lower() != "virtualmachines":
+                continue
+            raw.append(_sku_to_dict(sku, region))
+        print(f"  {region}: {sum(1 for r in raw if r['region']==region)} VM SKUs", file=sys.stderr)
+    return raw
+
+
+def _sku_to_dict(sku: Any, region: str) -> dict:
+    """Normalize SDK model into a plain dict so fixtures and live runs share a shape."""
+    caps = {c.name: c.value for c in (sku.capabilities or [])}
+    zones: list[str] = []
+    for li in (sku.location_info or []):
+        if (li.location or "").lower() == region.lower():
+            zones = list(li.zones or [])
+    restrictions = []
+    for r in (sku.restrictions or []):
+        info = r.restriction_info
+        restrictions.append({
+            "type": str(r.type),
+            "reason": str(r.reason_code),
+            "locations": [l.lower() for l in (info.locations or [])] if info else [],
+            "zones": list(info.zones or []) if info else [],
+        })
+    return {
+        "region": region.lower(),
+        "name": sku.name,
+        "family": (sku.family or "").strip(),
+        "capabilities": caps,
+        "zones": zones,
+        "restrictions": restrictions,
+    }
+
+
+def fetch_locations_live(credential, subscription: str) -> dict[str, dict]:
+    """Region metadata from the Subscriptions API: pair, geography, zone support."""
+    from azure.mgmt.resource.subscriptions import SubscriptionClient
+
+    client = SubscriptionClient(credential)
+    locs: dict[str, dict] = {}
+    for loc in client.subscriptions.list_locations(subscription):
+        md = loc.metadata
+        # region_type may be a plain string or an enum whose str() is "RegionType.PHYSICAL"
+        rtype = str(md.region_type or "").split(".")[-1].lower() if md else ""
+        if md is None or rtype not in ("physical", ""):
+            continue
+        pair = None
+        if md.paired_region:
+            pair = (md.paired_region[0].name or "").lower() or None
+        locs[loc.name.lower()] = {
+            "name": loc.name.lower(),
+            "display": loc.display_name,
+            "geography": md.geography,
+            "geography_group": md.geography_group,
+            "pair": pair,
+            "zonal": bool(loc.availability_zone_mappings),
+        }
+    return locs
+
+
+def expand_with_pairs(regions: list[str], locs: dict[str, dict]) -> tuple[list[str], dict[str, str]]:
+    """Append each region's pair (if any, not already listed). Returns (regions, {pair: primary})."""
+    out = list(regions)
+    added: dict[str, str] = {}
+    for r in regions:
+        p = (locs.get(r) or {}).get("pair")
+        if p and p not in out:
+            out.append(p)
+            added[p] = r
+    return out, added
+
+
+def fetch_quota_live(credential, subscription: str, regions: list[str]) -> list[QuotaRow]:
+    from azure.mgmt.compute import ComputeManagementClient
+
+    client = ComputeManagementClient(credential, subscription)
+    rows: list[QuotaRow] = []
+    for region in regions:
+        for u in client.usage.list(region):
+            name = u.name.value or ""
+            if not name.lower().endswith("family"):
+                continue
+            rows.append(QuotaRow(region.lower(), name, u.name.localized_value or name,
+                                 int(u.current_value or 0), int(u.limit or 0)))
+    return rows
+
+# --------------------------------------------------------------------------- #
+# Analysis
+# --------------------------------------------------------------------------- #
+
+def _to_int(v: Any) -> int | None:
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+def _to_float(v: Any) -> float | None:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def classify(raw: dict) -> SkuRow:
+    region = raw["region"]
+    zones_total = list(raw.get("zones") or [])
+    blocked: set[str] = set()
+    region_blocked = False
+    quota_blocked = False
+    reasons: list[str] = []
+
+    for r in raw.get("restrictions", []):
+        # enum reprs vary by SDK version: 'Zone' / 'ResourceSkuRestrictionsType.ZONE',
+        # 'QuotaId' / 'ResourceSkuRestrictionsReasonCode.QUOTA_ID' — normalize both
+        rtype = r["type"].split(".")[-1].replace("_", "").lower()
+        reason = r["reason"].split(".")[-1].replace("_", "").lower()
+        locs = r.get("locations") or []
+        if locs and region not in locs:
+            continue
+        reasons.append(f"{rtype}:{reason}")
+        if reason == "quotaid":
+            quota_blocked = True
+        elif rtype == "location":
+            region_blocked = True
+        elif rtype == "zone":
+            # the API can list zones the SKU isn't offered in; only count zones it actually has
+            blocked.update(set(r.get("zones") or []) & set(zones_total) if zones_total else set(r.get("zones") or []))
+
+    if quota_blocked and not region_blocked and not blocked:
+        status, loss = "quota_blocked", 0.0
+    elif region_blocked:
+        status, loss = "region_restricted", 1.0
+    elif blocked:
+        status = "zone_restricted"
+        loss = min(1.0, len(blocked) / len(zones_total)) if zones_total else 0.5
+    else:
+        status, loss = "available", 0.0
+
+    caps = raw.get("capabilities", {})
+    return SkuRow(
+        region=region,
+        sku=raw["name"],
+        family=raw.get("family") or "",
+        vcpus=_to_int(caps.get("vCPUs")),
+        memory_gb=_to_float(caps.get("MemoryGB")),
+        zones_total=len(zones_total),
+        zones_available=sorted(set(zones_total) - blocked),
+        zones_blocked=sorted(blocked),
+        status=status,
+        reason_codes=sorted(set(reasons)),
+        loss=round(loss, 3),
+    )
+
+
+def family_label(family: str) -> str:
+    """standardDv5Family -> Dv5 ; standardNCADSA100v4Family -> NCADSA100v4"""
+    f = family.strip()
+    if f.lower().startswith("standard"):
+        f = f[len("standard"):]
+    if f.lower().endswith("family"):
+        f = f[: -len("family")]
+    return f.strip() or "(none)"
+
+
+def matches_filters(row: SkuRow, families: list[str], sku_glob: str | None, min_vcpu: int,
+                    exclude: list[str] = ()) -> bool:
+    lab = family_label(row.family).lower()
+    if families and not any(lab.startswith(f.lower()) for f in families):
+        return False
+    if exclude and any(fnmatch.fnmatch(lab, e.lower()) for e in exclude):
+        return False
+    if sku_glob and not fnmatch.fnmatch(row.sku.lower(), sku_glob.lower()):
+        return False
+    if min_vcpu and (row.vcpus or 0) < min_vcpu:
+        return False
+    return True
+
+
+def summarize(rows: list[SkuRow]) -> list[FamilySummary]:
+    groups: dict[tuple[str, str], list[SkuRow]] = defaultdict(list)
+    for r in rows:
+        groups[(r.region, family_label(r.family))].append(r)
+    out: list[FamilySummary] = []
+    for (region, fam), items in sorted(groups.items()):
+        scored = [i for i in items if i.status != "quota_blocked"]
+        score = round(100 * sum(i.loss for i in scored) / len(scored), 1) if scored else 0.0
+        out.append(FamilySummary(
+            region=region, family=fam, n_skus=len(items),
+            n_available=sum(i.status == "available" for i in items),
+            n_zone_restricted=sum(i.status == "zone_restricted" for i in items),
+            n_region_restricted=sum(i.status == "region_restricted" for i in items),
+            n_quota_blocked=sum(i.status == "quota_blocked" for i in items),
+            score=score,
+            zone_slots_total=sum(i.zones_total for i in items),
+            zone_slots_blocked=sum(len(i.zones_blocked) for i in items),
+        ))
+    return out
+
+
+def region_scores(summ: list[FamilySummary]) -> dict[str, float]:
+    """SKU-weighted mean of family scores per region."""
+    acc: dict[str, list[float]] = defaultdict(list)
+    for s in summ:
+        n = s.n_skus - s.n_quota_blocked
+        acc[s.region].extend([s.score] * n)
+    return {r: round(sum(v) / len(v), 1) if v else 0.0 for r, v in acc.items()}
+
+
+def pair_summary(primaries: list[str], locs: dict[str, dict], summ: list[FamilySummary],
+                 rscores: dict[str, float]) -> list[dict]:
+    """One row per requested region: its pair, geography relationship, and score comparison."""
+    fam_idx: dict[tuple[str, str], FamilySummary] = {(s.region, s.family): s for s in summ}
+    fams = sorted({s.family for s in summ})
+    rows = []
+    for r in primaries:
+        meta = locs.get(r) or {}
+        pair = meta.get("pair")
+        pmeta = locs.get(pair) or {} if pair else {}
+        per_family = []
+        for f in fams:
+            a, b = fam_idx.get((r, f)), fam_idx.get((pair, f)) if pair else None
+            if a is None and b is None:
+                continue
+            per_family.append({
+                "family": f,
+                "primary": a.score if a else None,
+                "pair": b.score if b else None,
+                "pair_missing": pair is not None and b is None,
+            })
+        # families where BOTH sides are heavily withheld: nowhere to fail over
+        # pair lacking the family entirely counts as constrained (100); no pair at all -> not applicable
+        pair_has_data = pair is not None and any(s.region == pair for s in summ)
+        both_bad = [p["family"] for p in per_family
+                    if pair_has_data and (p["primary"] or 0) >= 50 and (p["pair"] if p["pair"] is not None else 100) >= 50]
+        rows.append({
+            "region": r,
+            "geography": meta.get("geography"),
+            "geography_group": meta.get("geography_group"),
+            "zonal": meta.get("zonal"),
+            "score": rscores.get(r),
+            "pair": pair,
+            "pair_geography": pmeta.get("geography"),
+            "pair_zonal": pmeta.get("zonal"),
+            "pair_score": rscores.get(pair) if pair else None,
+            "same_geography": (meta.get("geography") == pmeta.get("geography")) if pair and pmeta else None,
+            "pair_has_data": pair_has_data,
+            "per_family": per_family,
+            "both_constrained": both_bad,
+        })
+    return rows
+
+
+def diff_against(rows: list[SkuRow], baseline_path: Path) -> list[dict]:
+    base = json.loads(baseline_path.read_text())
+    prev = {(r["region"], r["name"]): classify(r) for r in base["skus"]}
+    changes = []
+    for r in rows:
+        p = prev.get((r.region, r.sku))
+        if p is None:
+            changes.append({"region": r.region, "sku": r.sku, "from": "(new)", "to": r.status})
+        elif p.status != r.status or p.zones_blocked != r.zones_blocked:
+            changes.append({"region": r.region, "sku": r.sku,
+                            "from": f"{p.status} {''.join(p.zones_blocked)}".strip(),
+                            "to": f"{r.status} {''.join(r.zones_blocked)}".strip()})
+    return changes
+
+# --------------------------------------------------------------------------- #
+# Output
+# --------------------------------------------------------------------------- #
+
+def write_csvs(out: Path, rows: list[SkuRow], summ: list[FamilySummary], quota: list[QuotaRow]) -> None:
+    with (out / "skus.csv").open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["region", "sku", "family", "vcpus", "memory_gb", "zones_total",
+                    "zones_available", "zones_blocked", "status", "reason_codes", "loss"])
+        for r in rows:
+            w.writerow([r.region, r.sku, family_label(r.family), r.vcpus, r.memory_gb, r.zones_total,
+                        " ".join(r.zones_available), " ".join(r.zones_blocked), r.status,
+                        " ".join(r.reason_codes), r.loss])
+    with (out / "summary.csv").open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(asdict(summ[0]).keys()) if summ else ["region"])
+        w.writeheader()
+        for s in summ:
+            w.writerow(asdict(s))
+    if quota:
+        with (out / "quota.csv").open("w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["region", "family", "localized", "current", "limit", "headroom_pct"])
+            for q in quota:
+                w.writerow([q.region, family_label(q.family), q.localized, q.current, q.limit, q.headroom_pct])
+
+
+def write_html(out: Path, rows: list[SkuRow], summ: list[FamilySummary], quota: list[QuotaRow],
+               changes: list[dict], meta: dict, pairs: list[dict], locs: dict[str, dict]) -> None:
+    template = (Path(__file__).parent / "report_template.html").read_text()
+    payload = {
+        "meta": meta,
+        "regionScores": region_scores(summ),
+        "pairs": pairs,
+        "locations": {r: locs[r] for r in meta["regions"] if r in locs},
+        "summary": [asdict(s) for s in summ],
+        "skus": [dict(asdict(r), family=family_label(r.family)) for r in rows],
+        "quota": [dict(asdict(q), family=family_label(q.family), headroom_pct=q.headroom_pct) for q in quota],
+        "changes": changes,
+    }
+    html = template.replace("/*__DATA__*/null", json.dumps(payload))
+    (out / "report.html").write_text(html)
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
+def main() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
+    ap = argparse.ArgumentParser(
+        prog="azcap",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="""\
+Azure region saturation scanner for VM SKUs.
+
+Reads the Resource SKUs API (what `az vm list-skus` shows) for each region and reports the
+percentage of VM SKUs Microsoft is withholding from THIS subscription — per region, per family,
+and per availability zone — plus the same view for each region's paired region.
+
+  score = % of VM SKUs withheld    0 = every SKU allocatable, 100 = none are
+    region-restricted SKU  -> counts fully      (NotAvailableForSubscription @ Location)
+    zone-restricted SKU    -> fraction of zones blocked, e.g. 1 of 3 = 0.33
+    quota-blocked SKU      -> reported, but excluded from the score (offer/quota, not capacity)
+
+Results are subscription-specific: run under the subscription that will actually deploy.""",
+        epilog="""\
+examples:
+  azcap --regions eastus,eastus2,canadacentral
+      scan three regions (and their pairs), all VM families, current az login
+
+  azcap --regions eastus,brazilsouth --zonal --exclude-families "*Promo,D,DS,G,GS,LS"
+      zone-resilient view: only SKUs offered in AZs, retired families dropped
+
+  azcap --regions saudiarabiaeast,uaenorth --tenant <tenant-id> --subscription <sub-id>
+      scan under a specific customer tenant/subscription; report is stamped with both
+
+  azcap --regions eastus --families Dv5,DSv5,Ev5,ESv5,NC,ND --include-quota
+      only the families you care about, with vCPU quota headroom per family
+
+  azcap --regions eastus --compare out-lastweek/raw.json --out out-today
+      diff against an earlier snapshot; changes appear in the report
+
+  azcap --regions eastus,brazilsouth --fixture fixtures/sample.json
+      offline run against a saved raw.json (no Azure calls)
+
+outputs (in --out, default ./out):
+  report.html   self-contained report: heatmap, pairs, zone pressure, quota, SKU table
+  summary.csv   region x family counts and score      skus.csv   one row per region x SKU
+  pairs.csv     region vs paired region               raw.json   API snapshot; reuse with --compare/--fixture
+
+auth: Azure CLI login by default (any DefaultAzureCredential source works).
+      az login [--tenant <id>]   then   az account list -o table   to see what you're signed into.
+""")
+
+    g = ap.add_argument_group("scope")
+    g.add_argument("--regions", required=True, metavar="R1,R2,...",
+                   help="region names to scan, e.g. eastus,canadacentral (az account list-locations -o table)")
+    g.add_argument("--no-pairs", action="store_true",
+                   help="do not add each region's Microsoft-designated paired region to the scan")
+
+    g = ap.add_argument_group("identity")
+    g.add_argument("--subscription", metavar="ID",
+                   help="subscription id (default: $AZURE_SUBSCRIPTION_ID, else `az account show`)")
+    g.add_argument("--tenant", metavar="ID",
+                   help="Entra tenant id to authenticate against; refuses to run if the subscription belongs elsewhere")
+
+    g = ap.add_argument_group("filters")
+    g.add_argument("--families", default="", metavar="F1,F2,...",
+                   help="keep only families whose label starts with one of these, e.g. Dv5,Ev5,NC,ND")
+    g.add_argument("--exclude-families", default="", metavar="G1,G2,...",
+                   help="drop families matching these globs, e.g. 'D,DS,G,GS,*Promo,LS,LSv2'")
+    g.add_argument("--sku", dest="sku_glob", metavar="GLOB",
+                   help="keep only SKU names matching a glob, e.g. 'Standard_D*s_v5'")
+    g.add_argument("--min-vcpu", type=int, default=0, metavar="N",
+                   help="drop SKUs smaller than N vCPUs")
+    g.add_argument("--zonal", action="store_true",
+                   help="keep only SKUs offered in availability zones in that region; regions without AZs show n/a")
+
+    g = ap.add_argument_group("data")
+    g.add_argument("--include-quota", action="store_true",
+                   help="also pull compute vCPU quota (used vs limit) per family per region")
+    g.add_argument("--compare", metavar="RAW.JSON",
+                   help="diff against a previous run's raw.json and list SKU status changes")
+    g.add_argument("--fixture", metavar="RAW.JSON",
+                   help="offline: read SKU data from a saved raw.json instead of calling Azure")
+    g.add_argument("--out", default="out", metavar="DIR", help="output directory (default: out)")
+
+    args = ap.parse_args()
+
+    primaries = [r.strip().lower() for r in args.regions.split(",") if r.strip()]
+    families = [f.strip() for f in args.families.split(",") if f.strip()]
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+
+    quota: list[QuotaRow] = []
+    locs: dict[str, dict] = {}
+    if args.fixture:
+        fx = json.loads(Path(args.fixture).read_text())
+        locs = fx.get("locations", {})
+        regions, added = (primaries, {}) if args.no_pairs else expand_with_pairs(primaries, locs)
+        raw = [r for r in fx["skus"] if r["region"] in regions]
+        quota = [QuotaRow(**q) for q in fx.get("quota", []) if q["region"] in regions]
+        subscription = fx.get("meta", {}).get("subscription", "fixture")
+        unknown: list[str] = []
+        subinfo = {"subscription_name": fx.get("meta", {}).get("subscription_name", "synthetic fixture"),
+                   "tenant_id": fx.get("meta", {}).get("tenant_id", "fixture")}
+    else:
+        subscription = resolve_subscription(args.subscription)
+        credential = make_credential(args.tenant)
+        try:
+            subinfo = describe_subscription(credential, subscription, args.tenant)
+            locs = fetch_locations_live(credential, subscription)
+        except Exception as e:  # ClientAuthenticationError and friends
+            if "Credential" in type(e).__name__ or "token" in str(e).lower():
+                hint = f" --tenant {args.tenant}" if args.tenant else ""
+                sys.exit("Azure authentication failed (token missing or expired). Run:\n"
+                         f"  az login{hint} --scope https://management.azure.com/.default\n"
+                         "then rerun.")
+            raise
+        print(f"Tenant {subinfo['tenant_id']} | subscription {subinfo['subscription_name']} ({subscription})",
+              file=sys.stderr)
+        unknown = [r for r in primaries if r not in locs]
+        if unknown:
+            if not locs:
+                sys.exit("Subscriptions API returned no physical regions for this subscription; cannot resolve "
+                         "region names or pairs. Retry with --no-pairs to scan without region metadata.")
+            # A region the Subscriptions API doesn't list is either misspelled or not enabled for this
+            # subscription (access-restricted / newer regions). Report it, don't abort.
+            for r in unknown:
+                near = [n for n in locs if r[:6] in n][:5]
+                hint = f" (did you mean: {', '.join(near)}?)" if near else ""
+                print(f"  ! {r}: not visible to this subscription — skipped{hint}", file=sys.stderr)
+            primaries = [r for r in primaries if r in locs]
+            if not primaries:
+                sys.exit("None of the requested regions are visible to this subscription. "
+                         "Use `az account list-locations -o table` for the names it can see.")
+        regions, added = (primaries, {}) if args.no_pairs else expand_with_pairs(primaries, locs)
+        for p, src in added.items():
+            print(f"  + {p} (pair of {src})", file=sys.stderr)
+        unpaired = [r for r in primaries if not locs[r].get("pair")]
+        if unpaired and not args.no_pairs:
+            print(f"  no paired region: {', '.join(unpaired)}", file=sys.stderr)
+        print(f"Scanning {len(regions)} region(s) under subscription {subscription}", file=sys.stderr)
+        raw = fetch_skus_live(credential, subscription, regions)
+        if args.include_quota:
+            quota = fetch_quota_live(credential, subscription, regions)
+
+    rows = [classify(r) for r in raw]
+    exclude = [e.strip() for e in args.exclude_families.split(",") if e.strip()]
+    rows = [r for r in rows if matches_filters(r, families, args.sku_glob, args.min_vcpu, exclude)]
+    if args.zonal:
+        before = {reg: sum(1 for r in rows if r.region == reg) for reg in regions}
+        rows = [r for r in rows if r.zones_total > 0]
+        for reg in regions:
+            after = sum(1 for r in rows if r.region == reg)
+            if after == 0 and before.get(reg):
+                print(f"  {reg}: no zonal SKUs (region has no availability zones) — dropped by --zonal", file=sys.stderr)
+    if not rows:
+        sys.exit("No SKUs matched. Check region names / filters.")
+
+    if families:
+        want = [f.lower() for f in families]
+        quota = [q for q in quota if any(family_label(q.family).lower().startswith(f) for f in want)]
+
+    summ = summarize(rows)
+    changes = diff_against(rows, Path(args.compare)) if args.compare else []
+
+    rs = region_scores(summ)
+    pairs = [] if args.no_pairs else pair_summary(primaries, locs, summ, rs)
+
+    meta = {
+        "generated": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "subscription": subscription,
+        "subscription_name": subinfo["subscription_name"],
+        "tenant_id": subinfo["tenant_id"],
+        "regions": regions,
+        "primaries": primaries,
+        "not_visible": unknown if not args.fixture else [],
+        "pair_of": added,
+        "families": families,
+        "exclude_families": exclude,
+        "zonal_only": bool(args.zonal),
+        "sku_glob": args.sku_glob,
+        "compare": args.compare,
+    }
+    (out / "raw.json").write_text(json.dumps({"meta": meta, "skus": raw, "locations": locs,
+                                              "quota": [asdict(q) for q in quota]}, indent=1))
+    write_csvs(out, rows, summ, quota)
+    if pairs:
+        with (out / "pairs.csv").open("w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["region", "geography", "zonal", "score", "pair", "pair_geography", "pair_zonal",
+                        "pair_score", "same_geography", "families_constrained_both_sides"])
+            for p in pairs:
+                w.writerow([p["region"], p["geography"], p["zonal"], p["score"], p["pair"] or "(none)",
+                            p["pair_geography"], p["pair_zonal"], p["pair_score"], p["same_geography"],
+                            " ".join(p["both_constrained"])])
+    write_html(out, rows, summ, quota, changes, meta, pairs, locs)
+
+    # console summary
+    print("\nRegion saturation — % of VM SKUs withheld from this subscription (0 = none, 100 = all):")
+    for region in regions:
+        n = sum(1 for r in rows if r.region == region)
+        rr = sum(1 for r in rows if r.region == region and r.status == "region_restricted")
+        zr = sum(1 for r in rows if r.region == region and r.status == "zone_restricted")
+        qb = sum(1 for r in rows if r.region == region and r.status == "quota_blocked")
+        tag = f"  (pair of {added[region]})" if region in added else ""
+        sc = f"{rs[region]:5.1f}% withheld" if region in rs else "  n/a         "
+        print(f"  {region:<22} {sc}   skus {n:4d}  region-restricted {rr:4d}  zone-restricted {zr:4d}  quota-blocked {qb:4d}{tag}")
+    if pairs:
+        print("\nPairs:")
+        for p in pairs:
+            if not p["pair"]:
+                print(f"  {p['region']:<22} no paired region")
+                continue
+            geo = "same geo" if p["same_geography"] else f"CROSS-GEO ({p['pair_geography']})"
+            zonal = "" if p["pair_zonal"] else ", pair has no zones"
+            if not p["pair_has_data"]:
+                zonal += ", no SKUs evaluated in pair"
+            both = f", both sides constrained: {' '.join(p['both_constrained'])}" if p["both_constrained"] else ""
+            ps = f"{p['score']:5.1f}" if p['score'] is not None else "  n/a"
+            pp = f"{p['pair_score']:5.1f}" if p['pair_score'] is not None else "  n/a"
+            print(f"  {p['region']:<22} {ps}  ->  {p['pair']:<22} {pp}  {geo}{zonal}{both}")
+    if changes:
+        print(f"\n{len(changes)} change(s) since baseline — see report.html")
+    print(f"\nWrote {out/'report.html'}, {out/'summary.csv'}, {out/'skus.csv'}, {out/'raw.json'}")
+
+
+if __name__ == "__main__":
+    main()

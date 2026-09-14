@@ -1,0 +1,12 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+out/
+out-*/
+*.egg-info/
+build/
+dist/
+fixtures/sample.json
+.DS_Store
+_old/
