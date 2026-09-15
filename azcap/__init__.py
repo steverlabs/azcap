@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-azcap — Azure VM SKU restriction-pressure scanner.
+azcap — Azure VM SKU restriction scanner.
 
 Reads the Resource SKUs API (the same data behind `az vm list-skus`) and,
-optionally, compute quota usage, then calculates a comparative restriction
-pressure index for each region x VM family. Produces CSVs and a self-contained
+optionally, compute quota usage, then reports the share of VM SKUs that are
+restricted for this subscription, per region x VM family. Produces CSVs and a self-contained
 HTML heatmap report.
 
 What the signals mean
@@ -17,19 +17,19 @@ What the signals mean
                      regions before region-level restriction kicks in.
   quota_blocked      QuotaId restriction — a quota or subscription-eligibility
                      signal. It is tracked separately and excluded from the
-                     restriction-pressure score.
+                     % restricted figure.
   available          No restrictions.
 
-Restriction-pressure score (0-100) per region x family
--------------------------------------------------------
+% restricted per region x family
+--------------------------------
   For each SKU: loss = 1.0 if region_restricted
                      = blocked_zones / total_zones if zone_restricted
                      = 0 otherwise
-  score = 100 * mean(loss) over assessable SKUs in the family. Quota-blocked
-          SKUs are excluded; if none remain, the score is n/a rather than zero.
+  % restricted = 100 * mean(loss) over assessed SKUs in the family. Quota-blocked
+          SKUs are excluded; if none remain, the figure is n/a rather than zero.
 
-This score is a comparative availability proxy, not a published Azure capacity
-percentage. All data is subscription-specific; run it under the subscription
+This is a subscription-specific availability proxy, not a published Azure
+capacity percentage. All data is subscription-specific; run it under the subscription
 that will actually deploy, not a sandbox.
 
 Usage
@@ -416,7 +416,7 @@ def pair_summary(
                     "pair_missing": pair is not None and b is None,
                 }
             )
-        # Families where both sides have high restriction pressure: nowhere to fail over.
+        # Families heavily restricted on both sides: nowhere to fail over.
         # pair lacking the family entirely counts as constrained (100); no pair at all -> not applicable
         pair_has_data = pair is not None and any(s.region == pair for s in summ)
         both_bad = [
@@ -680,19 +680,19 @@ def main() -> None:
         prog="azcap",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="""\
-Azure VM SKU restriction-pressure scanner.
+Azure VM SKU restriction scanner.
 
-Reads the Resource SKUs API (what `az vm list-skus` shows) for each region and reports the
-normalized exposure to subscription-specific SKU restrictions — per region, per family, and per
+Reads the Resource SKUs API (what `az vm list-skus` shows) for each region and reports the share
+of VM SKUs that are restricted for THIS subscription — per region, per family, and per
 availability zone — plus the same view for each region's paired region.
 
-  score = restriction pressure     0 = no assessed restrictions, 100 = fully restricted
+  % restricted = share of assessed SKUs restricted   0 = none, 100 = all
     region-restricted SKU  -> counts fully      (NotAvailableForSubscription @ Location)
     zone-restricted SKU    -> fraction of zones blocked, e.g. 1 of 3 = 0.33
-    quota-blocked SKU      -> reported, but excluded from the score (offer/quota, not capacity)
+    quota-blocked SKU      -> reported, but not assessed (offer/quota eligibility, not capacity)
 
-This is a comparative availability proxy, not a published Azure capacity percentage. Results are
-subscription-specific: run under the subscription that will actually deploy.""",
+Restrictions are a subscription-specific availability proxy, not a published Azure capacity figure.
+Run under the subscription that will actually deploy.""",
         epilog="""\
 examples:
   azcap --regions eastus,eastus2,canadacentral
@@ -714,12 +714,12 @@ examples:
       offline run against a saved raw.json (no Azure calls)
 
 outputs (in --out, default ./out):
-  report.html   self-contained report: heatmap, pairs, zone pressure, quota, SKU table
+  report.html   self-contained report: heatmap, pairs, zone restrictions, quota, SKU table
   summary.csv   region x family counts and score      skus.csv   one row per region x SKU
   pairs.csv     region vs paired region               raw.json   API snapshot; reuse with --compare/--fixture
 
 auth: Azure CLI login by default (any DefaultAzureCredential source works).
-	az login [--tenant <id>]   then   az account list -o table   to see what you're signed into.
+      az login [--tenant <id>]   then   az account list -o table   to see what you're signed into.
 """,
     )
     ap.add_argument("--version", action="version", version=f"%(prog)s {package_version()}")
@@ -740,7 +740,7 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
         "--region-weighting",
         choices=("sku", "family"),
         default="sku",
-        help="aggregate region scores by assessed SKU count or equally by family (default: sku)",
+        help="aggregate the region figure by assessed SKU count or equally by family (default: sku)",
     )
 
     g = ap.add_argument_group("identity")
@@ -1011,14 +1011,14 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
     write_html(out, rows, summ, quota, changes, meta, pairs, locs)
 
     # console summary
-    print(f"\nRegion SKU restriction pressure (0 = none, 100 = fully restricted; {args.region_weighting}-weighted):")
+    print(f"\n% of assessed VM SKUs restricted for this subscription ({args.region_weighting}-weighted):")
     for region in regions:
         n = sum(1 for r in rows if r.region == region)
         rr = sum(1 for r in rows if r.region == region and r.status == "region_restricted")
         zr = sum(1 for r in rows if r.region == region and r.status == "zone_restricted")
         qb = sum(1 for r in rows if r.region == region and r.status == "quota_blocked")
         tag = f"  (pair of {added[region]})" if region in added else ""
-        sc = f"{rs[region]:5.1f} pressure" if rs.get(region) is not None else "  n/a         "
+        sc = f"{rs[region]:5.1f}% restricted" if rs.get(region) is not None else "  n/a           "
         print(
             f"  {region:<22} {sc}   skus {n:4d}  region-restricted {rr:4d}  "
             f"zone-restricted {zr:4d}  quota-blocked {qb:4d}{tag}"

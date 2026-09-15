@@ -1,10 +1,10 @@
-# azcap — Azure VM SKU restriction-pressure scanner
+# azcap — Azure VM SKU restriction scanner
 
 Microsoft does not publish per-region capacity. What it does expose, per subscription, is the
 set of VM SKUs currently marked unavailable in each region and zone — via the Resource SKUs API
-(`az vm list-skus`). This tool turns those restrictions into a comparative pressure score
-per region × VM family and renders a self-contained HTML report you can drop into a deck. The score
-is an availability proxy, not a published Azure capacity percentage or an allocation guarantee.
+(`az vm list-skus`). This tool reports the share of VM SKUs that are restricted, per region ×
+VM family, and renders a self-contained HTML report you can drop into a deck. Restrictions are a
+subscription-specific availability proxy, not a published Azure capacity percentage or an allocation guarantee.
 
 ## Install
 
@@ -61,7 +61,7 @@ azcap --regions eastus --no-pairs
 # diff against last week's snapshot
 azcap --regions eastus --compare out-lastweek/raw.json
 
-# give each VM family equal weight in the aggregate region score (default is per-SKU weighting)
+# give each VM family equal weight in the region figure (default is per-SKU weighting)
 azcap --regions eastus,eastus2 --region-weighting family
 
 # create shareable artifacts without tenant/subscription names or ids
@@ -76,8 +76,8 @@ Outputs land in `--out` (default `out/`):
 
 | file | contents |
 |---|---|
-| `report.html` | heatmap (region × family), zone pressure, quota headroom, changes, filterable SKU table |
-| `summary.csv` | one row per region × family with counts, assessable count, and pressure score |
+| `report.html` | heatmap (region × family), zone-level restrictions, quota headroom, changes, filterable SKU table |
+| `summary.csv` | one row per region × family with counts, assessed count, and % restricted |
 | `skus.csv` | one row per region × SKU with status, zones, reason codes |
 | `pairs.csv` | one row per requested region: pair, geography match, zone support, both-side scores |
 | `quota.csv` | with `--include-quota`: used vs limit per family |
@@ -89,18 +89,20 @@ Outputs land in `--out` (default `out/`):
 |---|---|---|
 | `region_restricted` | `NotAvailableForSubscription` @ Location | Microsoft won't allocate this SKU to this subscription in this region. Strongest restriction signal. |
 | `zone_restricted` | `NotAvailableForSubscription` @ Zone | Allocatable in some zones only. Early warning; also breaks zone-redundant designs. |
-| `quota_blocked` | `QuotaId` | A quota or subscription-eligibility restriction. Excluded from the restriction-pressure score; use `--include-quota` to inspect the reported family limit and usage. |
+| `quota_blocked` | `QuotaId` | A quota or subscription-eligibility restriction. Not assessed (excluded from % restricted); use `--include-quota` to inspect the reported family limit and usage. |
 | `available` | — | No restriction. Does not guarantee allocation at deploy time. |
 
-**Score = normalized restriction pressure (0–100).** Per region × family it is the mean restriction
-loss across assessable SKUs, where a region-restricted SKU counts 1.0 and a zone-restricted SKU
-counts `blocked_zones / total_zones`; × 100. Quota-blocked SKUs are excluded. If none remain, the
-score is `n/a`, not zero.
+**The figure is % of assessed SKUs restricted (0–100).** Per region × family it is the mean restriction
+loss across assessed SKUs, where a region-restricted SKU counts 1.0 and a zone-restricted SKU
+counts `blocked_zones / total_zones`; × 100. Quota-blocked SKUs are not assessed. If none remain, the
+figure is `n/a`, not zero.
 
-The aggregate region score is weighted by assessed SKU count by default, so families with more
-enumerated sizes have more influence. Use `--region-weighting family` to weight every assessed
-family equally, and use `--families` / `--sku` to make the scope resemble the workload you intend
-to deploy.
+The region figure is weighted by assessed SKU count by default, so it is literally the share of
+assessed SKUs in that region that are restricted; families with more enumerated sizes have more
+influence. Use `--region-weighting family` to weight every assessed
+family equally (the figure is then an average of family rates, no longer a share of SKUs — the report
+header shows which weighting was used), and use `--families` / `--sku` to make the scope resemble the
+workload you intend to deploy.
 
 ## Paired regions
 
