@@ -132,7 +132,7 @@ def resolve_subscription(explicit: str | None) -> str:
 
 def make_credential(tenant: str | None):
     """DefaultAzureCredential, pinned to a tenant when one is given so multi-tenant
-    CLI logins (SII vs. customer) can't silently pick the wrong directory."""
+    CLI logins can't silently pick the wrong directory."""
     from azure.identity import AzureCliCredential, ChainedTokenCredential, DefaultAzureCredential
 
     if tenant:
@@ -702,7 +702,7 @@ examples:
       zone-resilient view: only SKUs offered in AZs, retired families dropped
 
   azcap --regions saudiarabiaeast,uaenorth --tenant <tenant-id> --subscription <sub-id>
-      scan under a specific customer tenant/subscription; report is stamped with both
+      scan under a specific tenant/subscription; report is stamped with both
 
   azcap --regions eastus --families Dv5,DSv5,Ev5,ESv5,NC,ND --include-quota
       only the families you care about, with vCPU quota headroom per family

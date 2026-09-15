@@ -46,7 +46,7 @@ azcap --regions eastus,southeastasia --families Dv5,DSv5,Ev5,ESv5,NC,ND --includ
 
 # name the tenant and subscription explicitly (results are subscription-specific;
 # the report header is stamped with tenant id + subscription name so runs across
-# SII and customer tenants stay distinguishable)
+# different tenants stay distinguishable)
 azcap --regions saudiarabiaeast --tenant <tenant-id> --subscription <sub-id>
 
 # drop retired / legacy families that only add noise to the score
@@ -117,8 +117,8 @@ can't pick it for you; pass both regions explicitly and compare rows.
 
 ## Caveats
 
-- Everything here is **per subscription**. Restrictions can differ between your tenant and the
-  customer's, and between EA / CSP / PAYG offers. Run it under the deploying subscription.
+- Everything here is **per subscription**. Restrictions can differ from one subscription to another,
+  including between EA, CSP, and pay-as-you-go offers. Run it under the subscription that will deploy.
 - Absence of a restriction is not a capacity guarantee. `AllocationFailed` /
   `OverconstrainedAllocationRequest` at deploy time can still happen. For committed capacity use
   On-demand Capacity Reservations.
