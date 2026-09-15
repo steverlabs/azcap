@@ -1,10 +1,13 @@
-# azcap — Azure VM SKU restriction scanner
+# azcap — Azure VM capacity scanner
 
-Microsoft does not publish per-region capacity. What it does expose, per subscription, is the
-set of VM SKUs currently marked unavailable in each region and zone — via the Resource SKUs API
-(`az vm list-skus`). This tool reports the zone-adjusted share of VM SKUs that are restricted, per region ×
-VM family, and renders a self-contained HTML report you can drop into a deck. Restrictions are a
-subscription-specific availability proxy, not a published Azure capacity percentage or an allocation guarantee.
+Microsoft does not publish per-region capacity. azcap gets as close as the platform allows,
+from two sources. The Resource SKUs API (`az vm list-skus`) shows which VM SKUs are restricted
+for your subscription in each region and zone; azcap reports that as a zone-adjusted % of SKUs
+restricted per region × family, with paired regions alongside. The Compute Recommender
+(preview) answers whether a specific allocation — N of a given SKU, zonal or regional — would
+place today, and distinguishes insufficient capacity from insufficient quota. Both are
+subscription-specific and neither is a published capacity figure or a reservation. Output is a
+self-contained HTML report plus CSVs.
 
 ## Install
 

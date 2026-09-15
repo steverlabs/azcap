@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-azcap — Azure VM SKU restriction scanner.
+azcap — Azure VM capacity scanner.
 
 Reads the Resource SKUs API (the same data behind `az vm list-skus`) and,
 optionally, compute quota usage, then reports the share of VM SKUs that are
-restricted for this subscription, per region x VM family. Produces CSVs and a self-contained
-HTML heatmap report.
+restricted for this subscription, per region x VM family; with --need it also asks
+the Compute Recommender whether a specific allocation would place today. Produces
+CSVs and a self-contained HTML heatmap report.
 
 What the signals mean
 ---------------------
@@ -1063,11 +1064,12 @@ def main() -> None:
         prog="azcap",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="""\
-Azure VM SKU restriction scanner.
+Azure VM capacity scanner.
 
 Reads the Resource SKUs API (what `az vm list-skus` shows) for each region and reports the share
 of VM SKUs that are restricted for THIS subscription — per region, per family, and per
-availability zone — plus the same view for each region's paired region.
+availability zone — plus the same view for each region's paired region. With --need it also asks
+the Compute Recommender (preview) whether a specific allocation would place today.
 
   zone-adjusted % restricted   0 = no assessed SKU restricted, 100 = all restricted
     region-restricted SKU  -> counts fully      (NotAvailableForSubscription @ Location)
