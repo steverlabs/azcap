@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import importlib.util
 import json
 import re
 import subprocess
@@ -40,8 +41,18 @@ from azcap import (
     write_html,
 )
 
-FIXTURE = Path(__file__).resolve().parent.parent / "fixtures" / "sample.json"
-WAVE1 = Path(__file__).resolve().parent.parent / "fixtures" / "wave1.yaml"
+GENERATOR = Path(__file__).resolve().parent.parent / "fixtures" / "make_fixture.py"
+
+
+@pytest.fixture(scope="session")
+def fixture_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """sample.json + wave1.yaml built by fixtures/make_fixture.py (sample.json is gitignored, so build it here)."""
+    spec = importlib.util.spec_from_file_location("make_fixture", GENERATOR)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    out = tmp_path_factory.mktemp("fixtures")
+    module.build(out / "sample.json")
+    return out
 
 
 def raw_sku(
@@ -714,7 +725,7 @@ VALID_PROFILE = {
 }
 
 
-def test_parse_profile_accepts_yaml_and_json_and_defaults(tmp_path: Path) -> None:
+def test_parse_profile_accepts_yaml_and_json_and_defaults(tmp_path: Path, fixture_dir: Path) -> None:
     yaml_path = tmp_path / "wave1.yaml"
     yaml_path.write_text(
         "name: wave1\nos: Windows\nzonal: true\nvms:\n  - sku: Standard_D8s_v5\n    count: 12\n"
@@ -732,7 +743,9 @@ def test_parse_profile_accepts_yaml_and_json_and_defaults(tmp_path: Path) -> Non
 
     assert load_profile(yaml_path) == expected
     assert load_profile(json_path) == expected
-    assert load_profile(WAVE1).name == "wave1" and load_profile(WAVE1).zonal is True
+    wave1 = fixture_dir / "wave1.yaml"
+    assert load_profile(wave1).name == "wave1" and load_profile(wave1).zonal is True
+    assert wave1.read_text(encoding="utf-8") == (GENERATOR.parent / "wave1.yaml").read_text(encoding="utf-8")
     assert parse_profile({"name": "min", "vms": [{"sku": "Standard_D2_v5", "count": 1}]}) == Profile(
         name="min", os="Linux", zonal=False, vms=[ProfileVm("Standard_D2_v5", 1, False)]
     )
@@ -991,15 +1004,23 @@ def test_pair_verdict_notes_use_quota_and_capacity_wording() -> None:
     assert "cannot place" not in pairs[3]["dr_note"].split("pair:")[1]
 
 
-def run_cli(*args: str, out: Path) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [sys.executable, "-m", "azcap", "--fixture", str(FIXTURE), "--out", str(out), *args],
-        capture_output=True,
-        text=True,
-    )
+@pytest.fixture
+def run_cli(fixture_dir: Path):
+    """Run azcap against the generated sample.json: run_cli(*args, out=dir) -> CompletedProcess."""
+
+    def run(*args: str, out: Path) -> subprocess.CompletedProcess:
+        fixture = fixture_dir / "sample.json"
+        return subprocess.run(
+            [sys.executable, "-m", "azcap", "--fixture", str(fixture), "--out", str(out), *args],
+            capture_output=True,
+            text=True,
+        )
+
+    return run
 
 
-def test_cli_profile_writes_verdicts_and_gates_with_exit_codes(tmp_path: Path) -> None:
+def test_cli_profile_writes_verdicts_and_gates_with_exit_codes(tmp_path: Path, fixture_dir: Path, run_cli) -> None:
+    WAVE1 = fixture_dir / "wave1.yaml"
     ok = run_cli("--regions", "eastus2,brazilsouth", "--profile", str(WAVE1), out=tmp_path / "a")
     assert ok.returncode == 0
     assert 'Workload "wave1" (zonal, Linux):' in ok.stdout
@@ -1064,12 +1085,27 @@ def test_cli_profile_writes_verdicts_and_gates_with_exit_codes(tmp_path: Path) -
     )
     assert blocked.returncode == EXIT_BLOCKED and "brazilsouth" in blocked.stderr.splitlines()[-1]
     # the auto-added pair (southcentralus) is blocked but only primaries gate without --require-pair
-    fine = run_cli("--regions", "eastus2", "--profile", str(WAVE1), "--fail-on-blocked", out=tmp_path / "d")
+    fine = run_cli(
+        "--regions",
+        "eastus2",
+        "--profile",
+        str(WAVE1),
+        "--fail-on-blocked",
+        out=tmp_path / "d",
+    )
     assert fine.returncode == 0
     gpu = tmp_path / "gpu.json"
     gpu.write_text(json.dumps({"name": "gpu", "zonal": True, "vms": [{"sku": "Standard_NC24ads_A100_v4", "count": 1}]}))
     assert (
-        run_cli("--regions", "eastus2", "--profile", str(gpu), "--fail-on-blocked", out=tmp_path / "e").returncode == 0
+        run_cli(
+            "--regions",
+            "eastus2",
+            "--profile",
+            str(gpu),
+            "--fail-on-blocked",
+            out=tmp_path / "e",
+        ).returncode
+        == 0
     )
     pair_gate = run_cli(
         "--regions", "eastus2", "--profile", str(gpu), "--fail-on-blocked", "--require-pair", out=tmp_path / "f"
@@ -1082,8 +1118,17 @@ def test_cli_profile_writes_verdicts_and_gates_with_exit_codes(tmp_path: Path) -
     assert not (tmp_path / "a" / "verdicts.csv").exists()
 
 
-def test_cli_profile_argument_rules(tmp_path: Path) -> None:
-    both = run_cli("--regions", "eastus2", "--profile", str(WAVE1), "--need", "Standard_D8s_v5:1", out=tmp_path)
+def test_cli_profile_argument_rules(tmp_path: Path, fixture_dir: Path, run_cli) -> None:
+    WAVE1 = fixture_dir / "wave1.yaml"
+    both = run_cli(
+        "--regions",
+        "eastus2",
+        "--profile",
+        str(WAVE1),
+        "--need",
+        "Standard_D8s_v5:1",
+        out=tmp_path,
+    )
     assert both.returncode == 2 and "mutually exclusive" in both.stderr
     no_profile = run_cli("--regions", "eastus2", "--fail-on-blocked", out=tmp_path)
     assert no_profile.returncode == 2 and "--fail-on-blocked requires --profile" in no_profile.stderr
