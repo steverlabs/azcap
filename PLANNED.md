@@ -1,8 +1,8 @@
 # Planned updates
 
 Ranked by how much each would change a real deployment decision. Items are independent; none
-is scheduled. Item 1 shipped in 0.3.0; it is the only one that adds information Microsoft holds
-about capacity rather than another view of restrictions.
+is scheduled. Item 1 shipped in 0.3.0 (the only one that adds information Microsoft holds about
+capacity rather than another view of restrictions) and item 2 in 0.4.0.
 
 ## 1. Placement scores (Compute Recommender) — done (0.3.0)
 
@@ -21,13 +21,18 @@ Not done: the GA spot endpoint (`placementScores/spot/generate`, 2025-06-05) ret
 High/Medium/Low scores in a different shape; `--spot` uses the skuMix endpoint with `priority: Spot`
 instead so the output stays one shape. Revisit if the skuMix API stops accepting spot.
 
-## 2. Deployability against a workload profile
+## 2. Deployability against a workload profile — done (0.4.0)
 
-`--profile wave1.yaml` naming SKUs, counts, and whether zonal placement is required. Combine
-restrictions, quota headroom (`--include-quota`), zone support, and (when available) placement
-scores into a per-region verdict: deployable / blocked by quota (family, vCPU needed vs available)
-/ blocked by restriction / blocked by capacity. Add `--fail-on-blocked` so the tool can gate a
-Bicep/Terraform pipeline with an exit code.
+Shipped as `--profile wave1.yaml` (YAML or JSON: name, os, zonal, vms[sku, count, optional]).
+Every scanned region gets a verdict from restrictions, family quota (needs summed per family
+across the profile), zone support, and placement probes, in the fixed order not offered →
+restricted → quota → capacity → deployable; a failed probe leaves a VM unknown rather than
+blocked, and optional VMs never block. Pairs carry both verdicts and a DR note. Output: a
+“Workload verdict” report section, `verdicts.csv`, `raw.json["verdicts"]`, a console block, and
+`--fail-on-blocked` (exit 3; `--require-pair` extends the gate to the paired region).
+
+Possible follow-up: workload-weighted scoring — the profile is now the workload definition that
+idea was waiting for, so the heatmap could weight families by what the profile actually deploys.
 
 ## 3. Other resource types from the same Resource SKUs API
 
@@ -65,7 +70,3 @@ with OIDC to a read-only service principal is enough for collection.
 
 For a restricted SKU, list unrestricted SKUs in the same region with comparable vCPU/memory and
 their price from the Retail Prices API (no auth). Turns a red cell into an answer.
-
-## Deferred
-
-- Workload-weighted scoring: needs a workload-profile format first (item 2 provides it).

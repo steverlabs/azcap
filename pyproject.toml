@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "azcap"
-version = "0.3.0"
-description = "Azure VM capacity scanner — SKU restrictions and placement probes per region, family, zone, and paired region"
+version = "0.4.0"
+description = "Azure VM capacity scanner — SKU restrictions, placement probes, and workload verdicts per region, family, zone, and paired region"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "Steve Ross" }]
-keywords = ["azure", "capacity", "vm", "sku", "availability-zones", "region-pairs"]
+keywords = ["azure", "capacity", "vm", "sku", "availability-zones", "region-pairs", "deployability"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Operating System :: OS Independent",
@@ -21,6 +21,7 @@ dependencies = [
   "azure-identity>=1.17",
   "azure-mgmt-compute>=30",
   "azure-mgmt-resource-subscriptions>=1.0",
+  "pyyaml>=6",
 ]
 
 [project.optional-dependencies]

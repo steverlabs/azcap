@@ -12,3 +12,4 @@ fixtures/sample.json
 _old/
 .pytest_cache/
 .ruff_cache/
+smoke.yaml

@@ -41,6 +41,13 @@ Placement probes (--need)
   This is the only capacity signal Azure exposes; it describes a hypothetical
   allocation at the time of the run and is not a reservation.
 
+Workload verdicts (--profile)
+-----------------------------
+  A profile names the VMs a deployment needs (SKU, count, optional?) and whether it
+  must be zone-resilient. Per region each VM gets the first verdict that applies:
+  not offered -> restricted -> quota -> capacity -> deployable. A region is deployable
+  only when every required VM is; --fail-on-blocked turns that into exit code 3.
+
 Usage
 -----
   python azcap.py --regions eastus,eastus2,canadacentral --families Dv5,Ev5,NC
@@ -48,6 +55,7 @@ Usage
   python azcap.py --regions eastus --fixture fixtures/sample.json   # offline
   python azcap.py --regions eastus --compare out/previous/raw.json  # diff
   python azcap.py --regions eastus2,brazilsouth --zonal --need Standard_D8s_v5:12
+  python azcap.py --regions eastus2 --profile wave1.yaml --fail-on-blocked   # exit 3 if blocked
 
 Auth: DefaultAzureCredential (az login, env vars, managed identity, etc.).
 Subscription: --subscription, else AZURE_SUBSCRIPTION_ID, else `az account show`.
@@ -138,6 +146,50 @@ class ProbeResult:
     detail: str | None = None  # why: the quota family the API named, or the quota figures a pre-check tripped on
     skus: list[str] = field(default_factory=list)  # every SKU in the request, in rank order
 
+
+@dataclass
+class ProfileVm:
+    sku: str
+    count: int
+    optional: bool = False  # reported, never blocks the region verdict
+
+
+@dataclass
+class Profile:
+    """A workload to judge regions against: what has to deploy, and whether it must span zones."""
+
+    name: str
+    os: str = "Linux"
+    zonal: bool = False
+    vms: list[ProfileVm] = field(default_factory=list)
+
+
+@dataclass
+class VmVerdict:
+    region: str
+    sku: str
+    count: int
+    optional: bool
+    status: str  # deployable | not offered | restricted | quota | capacity | unknown
+    reason: str
+    family: str | None = None
+    vcpu_need: int | None = None
+    quota_limit: int | None = None
+    quota_used: int | None = None
+    probe_score: int | None = None
+    probe_fulfillment: str | None = None
+
+
+@dataclass
+class RegionVerdict:
+    region: str
+    verdict: str  # deployable | blocked | unknown
+    blocking: list[str]  # "quota: Standard_D8s_v5 (standardDSv5Family limit 0, need 96 vCPU)" per required VM
+    vms: list[VmVerdict]
+
+
+VM_BLOCKING_STATUSES = ("not offered", "restricted", "quota", "capacity")
+EXIT_BLOCKED = 3
 
 ARM_ENDPOINT = "https://management.azure.com"
 ARM_SCOPE = "https://management.azure.com/.default"
@@ -602,6 +654,215 @@ def pair_placement_notes(pairs: list[dict], probes: list[ProbeResult]) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Workload profiles and verdicts
+# --------------------------------------------------------------------------- #
+
+PROFILE_KEYS = {"name", "os", "zonal", "vms"}
+PROFILE_VM_KEYS = {"sku", "count", "optional"}
+
+
+def parse_profile(data: Any) -> Profile:
+    """Validate a decoded profile (YAML or JSON) strictly; every problem is a ValueError with a short message."""
+    if not isinstance(data, dict):
+        raise ValueError("profile must be a mapping with name, vms and optionally os, zonal")
+    unknown = sorted(set(data) - PROFILE_KEYS)
+    if unknown:
+        raise ValueError(f"profile has unknown key(s): {', '.join(unknown)} (allowed: name, os, zonal, vms)")
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("profile 'name' is required and must be a non-empty string")
+    os_type = data.get("os", "Linux")
+    if os_type not in ("Linux", "Windows"):
+        raise ValueError(f"profile 'os' must be Linux or Windows, got {os_type!r}")
+    zonal = data.get("zonal", False)
+    if not isinstance(zonal, bool):
+        raise ValueError(f"profile 'zonal' must be true or false, got {zonal!r}")
+    vms = data.get("vms")
+    if not isinstance(vms, list) or not vms:
+        raise ValueError("profile 'vms' must be a non-empty list")
+    parsed: list[ProfileVm] = []
+    for i, vm in enumerate(vms, 1):
+        if not isinstance(vm, dict):
+            raise ValueError(f"profile vms[{i}] must be a mapping with sku and count")
+        unknown = sorted(set(vm) - PROFILE_VM_KEYS)
+        if unknown:
+            raise ValueError(
+                f"profile vms[{i}] has unknown key(s): {', '.join(unknown)} (allowed: sku, count, optional)"
+            )
+        sku = vm.get("sku")
+        if not isinstance(sku, str) or not sku.strip() or any(c.isspace() for c in sku.strip()):
+            raise ValueError(f"profile vms[{i}] 'sku' is required and must be a SKU name like Standard_D8s_v5")
+        count = vm.get("count")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise ValueError(f"profile vms[{i}] ({sku}) 'count' must be an integer of 1 or more, got {count!r}")
+        optional = vm.get("optional", False)
+        if not isinstance(optional, bool):
+            raise ValueError(f"profile vms[{i}] ({sku}) 'optional' must be true or false, got {optional!r}")
+        sku = sku.strip()
+        if any(sku.lower() == existing.sku.lower() for existing in parsed):
+            raise ValueError(f"profile lists {sku} more than once")
+        parsed.append(ProfileVm(sku=sku, count=count, optional=optional))
+    return Profile(name=name.strip(), os=os_type, zonal=zonal, vms=parsed)
+
+
+def load_profile(path: Path) -> Profile:
+    """Read a .yaml/.yml (PyYAML) or .json profile. Raises ValueError with a CLI-ready message."""
+    suffix = path.suffix.lower()
+    if suffix not in (".yaml", ".yml", ".json"):
+        raise ValueError(f"profile {path}: expected a .yaml, .yml or .json file")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise ValueError(f"Cannot read profile {path}: {e}") from e
+    if suffix == ".json":
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in profile {path}: line {e.lineno}, column {e.colno}") from e
+    else:
+        try:
+            import yaml
+        except ImportError as e:  # pyyaml is a declared dependency, but a .json profile works without it
+            raise ValueError("Reading a YAML profile needs PyYAML (pip install pyyaml), or use a .json profile") from e
+        try:
+            data = yaml.safe_load(text)
+        except yaml.YAMLError as e:
+            raise ValueError(f"Invalid YAML in profile {path}: {e}") from e
+    try:
+        return parse_profile(data)
+    except ValueError as e:
+        raise ValueError(f"Invalid profile {path}: {e}") from e
+
+
+def _quota_reason(q: QuotaRow, need: int) -> str:
+    used = f", used {q.current}" if q.current else ""
+    return f"{q.family} limit {q.limit}{used}, need {need} vCPU"
+
+
+def workload_verdicts(
+    profile: Profile, regions: list[str], rows: list[SkuRow], quota: list[QuotaRow], probes: list[ProbeResult]
+) -> list[RegionVerdict]:
+    """Judge every region against the profile. Per VM the first of these that applies wins:
+    not offered -> restricted -> quota -> capacity -> deployable (unknown when the probe failed).
+    `rows` and `quota` must be the unfiltered scan so SKUs outside --families are still judged."""
+    by_sku = {(r.region, r.sku.lower()): r for r in rows}
+    quota_idx = {(q.region, q.family.lower()): q for q in quota}
+    probe_idx = {(p.region, p.sku.lower(), p.count): p for p in probes if p.sku != "mix" and not p.spot}
+    out: list[RegionVerdict] = []
+    for region in regions:
+        # quota is shared per family, so required VMs are checked against the family total; an optional VM
+        # is checked on top of that total and can only ever block itself
+        required_need: dict[str, int] = defaultdict(int)
+        for vm in profile.vms:
+            row = by_sku.get((region, vm.sku.lower()))
+            if row is not None and row.vcpus and not vm.optional:
+                required_need[row.family.lower()] += row.vcpus * vm.count
+        vms: list[VmVerdict] = []
+        for vm in profile.vms:
+            v = VmVerdict(region=region, sku=vm.sku, count=vm.count, optional=vm.optional, status="", reason="")
+            row = by_sku.get((region, vm.sku.lower()))
+            if row is None:
+                v.status, v.reason = "not offered", "SKU is not in this region's SKU list for the subscription"
+                vms.append(v)
+                continue
+            v.family = row.family
+            v.vcpu_need = row.vcpus * vm.count if row.vcpus else None
+            q = quota_idx.get((region, row.family.lower()))
+            if q is not None:
+                v.quota_limit, v.quota_used = q.limit, q.current
+            probe = probe_idx.get((region, vm.sku.lower(), vm.count))
+            if probe is not None and not probe.error:
+                v.probe_score, v.probe_fulfillment = probe.score, probe.fulfillment
+            need = required_need[row.family.lower()] + ((v.vcpu_need or 0) if vm.optional else 0)
+            if row.status == "region_restricted":
+                v.status, v.reason = "restricted", "region restricted for this subscription"
+            elif profile.zonal and row.zones_total == 0:
+                v.status, v.reason = "restricted", "region has no availability zones; the profile needs zones"
+            elif profile.zonal and len(row.zones_available) < 2:
+                usable = ", ".join(row.zones_available) or "none"
+                v.status = "restricted"
+                v.reason = f"usable zones: {usable}; zone-resilient placement needs 2 or more"
+            elif q is not None and v.vcpu_need is not None and (q.limit == 0 or q.limit - q.current < need):
+                v.status, v.reason = "quota", _quota_reason(q, need)
+            elif row.status == "quota_blocked":
+                v.status, v.reason = "quota", "QuotaId restriction for this subscription (offer or quota eligibility)"
+            elif probe is None or probe.error:
+                detail = f": {probe.error}" if probe is not None else ""
+                v.status, v.reason = "unknown", f"placement probe unavailable{detail}; restrictions and quota allow it"
+            elif probe.fulfillment == "InsufficientCapacity":
+                placed = sum(item.get("capacity") or 0 for item in probe.split)
+                score = f"score {probe.score}, " if probe.score is not None else ""
+                v.status, v.reason = "capacity", f"{score}{placed} of {vm.count} placed"
+            elif probe.fulfillment == "InsufficientQuota":
+                v.status = "quota"
+                v.reason = f"placement probe: insufficient quota{': ' + probe.detail if probe.detail else ''}"
+            elif probe.fulfillment == "None":
+                v.status, v.reason = "deployable", f"placed (score {probe.score})"
+            else:
+                v.status, v.reason = "unknown", f"placement probe answered {probe.fulfillment}"
+            vms.append(v)
+        required = [v for v in vms if not v.optional]
+        blocking = [f"{v.status}: {v.sku} ({v.reason})" for v in required if v.status in VM_BLOCKING_STATUSES]
+        if blocking:
+            verdict = "blocked"
+        elif any(v.status == "unknown" for v in required):
+            verdict = "unknown"
+        else:
+            verdict = "deployable"
+        out.append(RegionVerdict(region=region, verdict=verdict, blocking=blocking, vms=vms))
+    return out
+
+
+def probe_candidates(
+    profile: Profile, regions: list[str], rows: list[SkuRow], quota: list[QuotaRow]
+) -> dict[str, list[tuple[str, int]]]:
+    """Profile VMs per region that pass steps 1-3 (offered, not restricted, within quota) and so need a
+    placement probe; the rest are already decided and are not worth a call."""
+    undecided = workload_verdicts(profile, regions, rows, quota, [])
+    return {rv.region: [(v.sku, v.count) for v in rv.vms if v.status == "unknown"] for rv in undecided}
+
+
+def _dr_reasons(rv: RegionVerdict) -> str:
+    """Why a region is blocked, in the same words the placement notes use (quota is never 'cannot place')."""
+    words = {"quota": "quota blocks {sku}", "capacity": "cannot place {sku}"}
+    parts = [
+        words.get(v.status, "{sku} " + v.status).format(sku=v.sku)
+        for v in rv.vms
+        if not v.optional and v.status in VM_BLOCKING_STATUSES
+    ]
+    return "; ".join(parts)
+
+
+def pair_verdict_notes(pairs: list[dict], verdicts: list[RegionVerdict]) -> None:
+    """Annotate pair rows with both verdicts and a DR note: DR-ready / pair blocked / primary blocked / both blocked."""
+    by_region = {rv.region: rv for rv in verdicts}
+    for row in pairs:
+        a, b = by_region.get(row["region"]), by_region.get(row["pair"] or "")
+        row["verdict"] = a.verdict if a else None
+        row["pair_verdict"] = b.verdict if b else None
+        note = ""
+        if a is not None and b is not None:
+            if a.verdict == "deployable" and b.verdict == "deployable":
+                note = "DR-ready"
+            elif a.verdict == "blocked" and b.verdict == "blocked":
+                note = f"both blocked — {row['region']}: {_dr_reasons(a)}; pair: {_dr_reasons(b)}"
+            elif b.verdict == "blocked" and a.verdict == "deployable":
+                note = f"pair blocked: {_dr_reasons(b)}"
+            elif a.verdict == "blocked" and b.verdict == "deployable":
+                note = f"primary blocked: {_dr_reasons(a)}"
+            else:
+                unknown = [r.region for r in (a, b) if r.verdict == "unknown"]
+                blocked = [f"{r.region} blocked: {_dr_reasons(r)}" for r in (a, b) if r.verdict == "blocked"]
+                note = "; ".join(blocked + [f"{u} not determined (placement probe unavailable)" for u in unknown])
+        row["dr_note"] = note
+
+
+def short_sku(sku: str) -> str:
+    """Standard_D8s_v5 -> D8s_v5, for the console where the prefix is noise."""
+    return sku[len("Standard_") :] if sku.lower().startswith("standard_") else sku
+
+
+# --------------------------------------------------------------------------- #
 # Analysis
 # --------------------------------------------------------------------------- #
 
@@ -905,7 +1166,12 @@ def diff_against(
 
 
 def write_csvs(
-    out: Path, rows: list[SkuRow], summ: list[FamilySummary], quota: list[QuotaRow], probes: list[ProbeResult] = ()
+    out: Path,
+    rows: list[SkuRow],
+    summ: list[FamilySummary],
+    quota: list[QuotaRow],
+    probes: list[ProbeResult] = (),
+    verdicts: list[RegionVerdict] = (),
 ) -> None:
     with (out / "skus.csv").open("w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
@@ -989,6 +1255,47 @@ def write_csvs(
                 )
     else:
         (out / "probes.csv").unlink(missing_ok=True)
+    if verdicts:
+        with (out / "verdicts.csv").open("w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(
+                [
+                    "region",
+                    "sku",
+                    "count",
+                    "optional",
+                    "status",
+                    "reason",
+                    "family",
+                    "vcpu_need",
+                    "quota_limit",
+                    "quota_used",
+                    "probe_score",
+                    "probe_fulfillment",
+                    "region_verdict",
+                ]
+            )
+            for rv in verdicts:
+                for v in rv.vms:
+                    w.writerow(
+                        [
+                            v.region,
+                            v.sku,
+                            v.count,
+                            v.optional,
+                            v.status,
+                            v.reason,
+                            v.family,
+                            v.vcpu_need,
+                            v.quota_limit,
+                            v.quota_used,
+                            v.probe_score,
+                            v.probe_fulfillment,
+                            rv.verdict,
+                        ]
+                    )
+    else:
+        (out / "verdicts.csv").unlink(missing_ok=True)
 
 
 def json_for_html(value: Any) -> str:
@@ -1006,6 +1313,8 @@ def write_html(
     pairs: list[dict],
     locs: dict[str, dict],
     probes: list[ProbeResult] = (),
+    profile: Profile | None = None,
+    verdicts: list[RegionVerdict] = (),
 ) -> None:
     template = (Path(__file__).parent / "report_template.html").read_text(encoding="utf-8")
     report_meta = {k: v for k, v in meta.items() if not k.endswith("_fingerprint")}
@@ -1019,6 +1328,8 @@ def write_html(
         "quota": [dict(asdict(q), family=family_label(q.family), headroom_pct=q.headroom_pct) for q in quota],
         "changes": changes,
         "probes": [asdict(p) for p in probes],
+        "profile": asdict(profile) if profile else None,
+        "verdicts": [asdict(v) for v in verdicts],
     }
     html = template.replace("/*__DATA__*/null", json_for_html(payload))
     (out / "report.html").write_text(html, encoding="utf-8")
@@ -1099,6 +1410,10 @@ examples:
       ask Microsoft's Compute Recommender (preview) whether 12 x Standard_D8s_v5 would place
       across zones in each region right now; score 0-9 and reason appear next to the restrictions
 
+  azcap --regions eastus2 --profile wave1.yaml --fail-on-blocked
+      judge each region against a workload (SKUs, counts, zonal?) and exit 3 if a requested
+      region is blocked by restriction, quota, or capacity — for gating a pipeline
+
   azcap --regions eastus,brazilsouth --fixture fixtures/sample.json
       offline run against a saved raw.json (no Azure calls)
 
@@ -1107,6 +1422,13 @@ outputs (in --out, default ./out):
   summary.csv   region x family counts and score      skus.csv   one row per region x SKU
   pairs.csv     region vs paired region               raw.json   API snapshot; reuse with --compare/--fixture
   probes.csv    with --need: one row per region x placement probe
+  verdicts.csv  with --profile: one row per region x profile VM with status, reason, and region verdict
+
+exit codes:
+  0   finished (verdicts are informational unless --fail-on-blocked is set)
+  1   could not run: authentication, Azure request, or invalid input/fixture/profile
+  2   usage error (bad arguments)
+  3   --fail-on-blocked and a requested region is blocked (with --require-pair: or its pair is)
 
 auth: Azure CLI login by default (any DefaultAzureCredential source works).
       az login [--tenant <id>]   then   az account list -o table   to see what you're signed into.
@@ -1201,6 +1523,22 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
     )
     g.add_argument("--spot", action="store_true", help="probe spot placement instead of regular")
     g.add_argument(
+        "--profile",
+        metavar="PATH",
+        help="workload profile (.yaml/.yml/.json: name, os, zonal, vms[sku,count,optional]); judges every region "
+        "deployable or blocked; implies --include-quota and one placement probe per profile VM",
+    )
+    g.add_argument(
+        "--fail-on-blocked",
+        action="store_true",
+        help=f"with --profile: exit {EXIT_BLOCKED} when any requested region is blocked",
+    )
+    g.add_argument(
+        "--require-pair",
+        action="store_true",
+        help="with --fail-on-blocked: also fail when a requested region's paired region is blocked",
+    )
+    g.add_argument(
         "--probe-api-version",
         default=PROBE_API_VERSION,
         metavar="VER",
@@ -1221,6 +1559,22 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
     if args.need_mix and not needs:
         ap.error("--need-mix requires --need")
     mix = args.need_mix and len(needs) > 1
+    profile: Profile | None = None
+    if args.profile:
+        if needs:
+            ap.error("--profile and --need are mutually exclusive (the profile defines the probes)")
+        try:
+            profile = load_profile(Path(args.profile))
+        except ValueError as e:
+            ap.error(str(e))
+        needs = [(vm.sku, vm.count) for vm in profile.vms]
+        args.include_quota = True
+        args.os, args.spot = profile.os, False
+    if args.fail_on_blocked and not profile:
+        ap.error("--fail-on-blocked requires --profile")
+    if args.require_pair and not args.fail_on_blocked:
+        ap.error("--require-pair requires --fail-on-blocked")
+    probe_zonal = profile.zonal if profile else args.zonal
 
     primaries = ordered_unique([r.strip().lower() for r in args.regions.split(",") if r.strip()])
     families = ordered_unique([f.strip() for f in args.families.split(",") if f.strip()])
@@ -1327,7 +1681,7 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
                 quota = fetch_quota_live(credential, subscription, regions)
         except Exception as e:
             sys.exit(f"Azure request failed while collecting SKU/quota data ({type(e).__name__}): {e}")
-        if needs:
+        if needs and not profile:
             # Preview API: every failure is recorded per probe and never changes the restriction results.
             print(f"Placement probes: {1 if mix else len(needs)} per region via Compute Recommender", file=sys.stderr)
             probes = fetch_probes_live(
@@ -1338,7 +1692,7 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
                 mix=mix,
                 os_type=args.os,
                 spot=args.spot,
-                zonal=args.zonal,
+                zonal=probe_zonal,
                 raw=raw,
                 locs=locs,
                 api_version=args.probe_api_version,
@@ -1350,6 +1704,37 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
     except (KeyError, TypeError, ValueError) as e:
         source = f"fixture {args.fixture}" if args.fixture else "Azure response"
         sys.exit(f"Invalid SKU record in {source}: {e}")
+    all_rows, all_quota = list(rows), list(quota)  # verdicts judge the profile against the unfiltered scan
+    if profile:
+        # Only VMs still undecided after the not-offered / restricted / quota steps are worth a placement probe.
+        candidates = probe_candidates(profile, regions, all_rows, all_quota)
+        wanted = {(region, sku, count) for region, group in candidates.items() for sku, count in group}
+        if args.fixture:
+            probes = [p for p in probes if (p.region, p.sku, p.count) in wanted]
+        else:
+            skipped = len(regions) * len(profile.vms) - len(wanted)
+            print(
+                f"Placement probes: {len(wanted)} via Compute Recommender; {skipped} not needed "
+                "(decided by restrictions or quota)",
+                file=sys.stderr,
+            )
+            post = arm_poster(credential)
+            for region in regions:
+                if candidates[region]:
+                    probes += run_probes(
+                        post,
+                        subscription,
+                        [region],
+                        candidates[region],
+                        mix=False,
+                        os_type=profile.os,
+                        spot=False,
+                        zonal=profile.zonal,
+                        raw=raw,
+                        locs=locs,
+                        api_version=args.probe_api_version,
+                        quota=None,  # step 3 already checked the family total, which is stricter than per-SKU
+                    )
     exclude = ordered_unique([e.strip() for e in args.exclude_families.split(",") if e.strip()])
     rows = [r for r in rows if matches_filters(r, families, args.sku_glob, args.min_vcpu, exclude)]
     if args.zonal:
@@ -1398,6 +1783,7 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
         "probe_os": args.os,
         "probe_spot": bool(args.spot),
         "probe_api_version": args.probe_api_version if needs and not args.fixture else None,
+        "profile_name": profile.name if profile else None,
     }
     summ = summarize(rows)
     changes: list[dict] = []
@@ -1424,6 +1810,8 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
     rs = region_scores(summ, args.region_weighting)
     pairs = [] if args.no_pairs else pair_summary(primaries, locs, summ, rs)
     pair_placement_notes(pairs, probes)
+    verdicts = workload_verdicts(profile, regions, all_rows, all_quota, probes) if profile else []
+    pair_verdict_notes(pairs, verdicts)
 
     snapshot = {
         "meta": meta,
@@ -1431,9 +1819,11 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
         "locations": locs,
         "quota": [asdict(q) for q in quota],
         "probes": [asdict(p) for p in probes],
+        "profile": asdict(profile) if profile else None,
+        "verdicts": [asdict(v) for v in verdicts],
     }
     (out / "raw.json").write_text(json.dumps(snapshot, indent=1), encoding="utf-8")
-    write_csvs(out, rows, summ, quota, probes)
+    write_csvs(out, rows, summ, quota, probes, verdicts)
     if pairs:
         with (out / "pairs.csv").open("w", encoding="utf-8", newline="") as f:
             w = csv.writer(f)
@@ -1450,6 +1840,9 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
                     "same_geography",
                     "families_constrained_both_sides",
                     "placement_notes",
+                    "verdict",
+                    "pair_verdict",
+                    "dr_note",
                 ]
             )
             for p in pairs:
@@ -1466,11 +1859,14 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
                         p["same_geography"],
                         " ".join(p["both_constrained"]),
                         "; ".join(p["placement_notes"]),
+                        p["verdict"],
+                        p["pair_verdict"],
+                        p["dr_note"],
                     ]
                 )
     else:
         (out / "pairs.csv").unlink(missing_ok=True)
-    write_html(out, rows, summ, quota, changes, meta, pairs, locs, probes)
+    write_html(out, rows, summ, quota, changes, meta, pairs, locs, probes, profile, verdicts)
 
     # console summary
     print(f"\nZone-adjusted % of assessed VM SKUs restricted for this subscription ({args.region_weighting}-weighted):")
@@ -1507,10 +1903,42 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
             score = f"score {p.score}" if p.score is not None else "score -"
             tail = p.error or (f"split {split_summary(p)}" if p.split else "")
             print(f"  {p.region:<22} {probe_request_label(p):<36} {scope:<9} {score:<8} {probe_label(p):<22} {tail}")
+    if profile:
+        dr = {p["region"]: p.get("dr_note") for p in pairs}
+        print(f'\nWorkload "{profile.name}" ({"zonal" if profile.zonal else "regional"}, {profile.os}):')
+        for rv in verdicts:
+            if rv.verdict == "blocked":
+                detail = "; ".join(rv.blocking)
+            else:
+                detail = ", ".join(
+                    f"{short_sku(v.sku)} x{v.count} {v.reason if v.status == 'deployable' else v.status}"
+                    + (" (optional)" if v.optional else "")
+                    for v in rv.vms
+                )
+            optional_failing = [v for v in rv.vms if v.optional and v.status in VM_BLOCKING_STATUSES]
+            if rv.verdict == "blocked" and optional_failing:
+                detail += "; optional: " + ", ".join(f"{short_sku(v.sku)} {v.status}" for v in optional_failing)
+            tag = f"  (pair of {added[rv.region]})" if rv.region in added else ""
+            label = "BLOCKED" if rv.verdict == "blocked" else rv.verdict
+            print(f"  {rv.region:<22} {label:<11} {detail}{tag}")
+            if dr.get(rv.region):
+                print(f"  {'':<22} {'':<11} pair: {dr[rv.region]}")
     if changes:
         print(f"\n{len(changes)} change(s) since baseline — see report.html")
-    extra = f", {out / 'probes.csv'}" if probes else ""
+    extra = (f", {out / 'probes.csv'}" if probes else "") + (f", {out / 'verdicts.csv'}" if verdicts else "")
     print(f"\nWrote {out / 'report.html'}, {out / 'summary.csv'}, {out / 'skus.csv'}, {out / 'raw.json'}{extra}")
+
+    if args.fail_on_blocked:
+        verdict_of = {rv.region: rv for rv in verdicts}
+        gate = list(primaries)
+        if args.require_pair:
+            gate += [pair for pair, primary in added.items() if primary in primaries]
+        blocked = [r for r in ordered_unique(gate) if r in verdict_of and verdict_of[r].verdict == "blocked"]
+        if blocked:
+            print(
+                f'\nBlocked for workload "{profile.name}": {", ".join(blocked)} — exit {EXIT_BLOCKED}', file=sys.stderr
+            )
+            sys.exit(EXIT_BLOCKED)
 
 
 if __name__ == "__main__":

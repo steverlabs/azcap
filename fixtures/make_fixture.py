@@ -96,16 +96,52 @@ locations = {
     for r, (g, gg, p) in LOCATIONS.items()
 }
 
-# Placement probes (shape of azcap.ProbeResult): 12 x Standard_D8s_v5 per region, zonal where the region has zones.
-# Score tracks the region's restriction pressure; a few regions are pinned so the demo shows every outcome
-# (brazilsouth cannot place but its pair can; westus is quota-bound; eastasia has no preview API).
-PROBE_OUTCOMES = {"brazilsouth": (2, "InsufficientCapacity", 6), "westus": (6, "InsufficientQuota", 8)}
-probes = []
-for region, (zones, p_reg, _, _) in REGIONS.items():
-    sku, count = "Standard_D8s_v5", 12
-    score, fulfillment, placed = PROBE_OUTCOMES.get(region, (max(0, 9 - round(p_reg * 40)), "None", count))
-    if score <= 2 and fulfillment == "None":
-        fulfillment, placed = "InsufficientCapacity", 4 * score
+# Workload profile used by the demo and the tests: two required families plus an optional GPU SKU.
+PROFILE_VMS = [("Standard_D8s_v5", 12, False), ("Standard_E16s_v5", 4, False), ("Standard_NC24ads_A100_v4", 1, True)]
+WAVE1_YAML = """\
+# azcap workload profile: what wave 1 needs in a region before it can deploy there.
+name: wave1
+os: Linux
+zonal: true                     # the design is zone-resilient, so placement is judged across zones
+vms:
+  - sku: Standard_D8s_v5
+    count: 12
+  - sku: Standard_E16s_v5
+    count: 4
+  - sku: Standard_NC24ads_A100_v4
+    count: 1
+    optional: true              # reported, never blocks the verdict
+"""
+Path(__file__).with_name("wave1.yaml").write_text(WAVE1_YAML, encoding="utf-8")
+
+# Pin four regions so `--profile fixtures/wave1.yaml` on eastus2,brazilsouth shows every verdict:
+#   eastus2         deployable
+#   centralus       deployable, optional GPU SKU restricted (pair of eastus2 -> DR-ready)
+#   brazilsouth     blocked by capacity (D8s_v5 probe cannot place)
+#   southcentralus  blocked by quota (DSv5 family limit 0; pair of brazilsouth)
+SHOWCASE = {"eastus2", "centralus", "brazilsouth", "southcentralus"}
+for sku in skus:
+    if sku["region"] in SHOWCASE and sku["name"] in ("Standard_D8s_v5", "Standard_E16s_v5"):
+        sku["restrictions"] = []
+    if sku["region"] == "centralus" and sku["name"] == "Standard_NC24ads_A100_v4":
+        sku["restrictions"] = [
+            {"type": "Location", "reason": "NotAvailableForSubscription", "locations": ["centralus"], "zones": []}
+        ]
+    if sku["region"] == "eastus2" and sku["name"] == "Standard_NC24ads_A100_v4":
+        sku["restrictions"] = []
+for q in quota:
+    if q["region"] in SHOWCASE and q["family"] in ("standardDSv5Family", "standardESv5Family"):
+        q["current"], q["limit"] = 100, 500
+    if q["region"] == "southcentralus" and q["family"] == "standardDSv5Family":
+        q["current"], q["limit"] = 0, 0
+    if q["region"] == "eastus2" and q["family"] == "standardNCADSA100v4Family":
+        q["current"], q["limit"] = 0, 100
+quota_idx = {(q["region"], q["family"]): q for q in quota}
+family_of = {(s_["region"], s_["name"]): s_["family"] for s_ in skus}
+vcpus_of = {(s_["region"], s_["name"]): int(s_["capabilities"]["vCPUs"]) for s_ in skus}
+
+
+def make_probe(region, sku, count, score, fulfillment, placed, zones, detail=None):
     split = []
     if placed:
         buckets = zones or [None]
@@ -113,23 +149,47 @@ for region, (zones, p_reg, _, _) in REGIONS.items():
             n = placed // len(buckets) + (1 if i < placed % len(buckets) else 0)
             if n:
                 split.append({"name": sku, "zone": zone, "capacity": n, "capacity_max": n})
-    probes.append(
-        {
-            "region": region,
-            "sku": sku,
-            "count": count,
-            "zonal": bool(zones),
-            "spot": False,
-            "score": score if placed else None,
-            "fulfillment": fulfillment,
-            "split": split,
-            "valid_until": "2026-01-01T12:00:00Z",
-            "error": None,
-            "skus": [sku],
-        }
-    )
+    return {
+        "region": region,
+        "sku": sku,
+        "count": count,
+        "zonal": bool(zones),
+        "spot": False,
+        "score": score if placed else None,
+        "fulfillment": fulfillment,
+        "split": split,
+        "valid_until": "2026-01-01T12:00:00Z",
+        "error": None,
+        "detail": detail,
+        "skus": [sku],
+    }
+
+
+# Placement probes (shape of azcap.ProbeResult): one per profile VM per region, zonal where the region has zones.
+# Score tracks the region's restriction pressure; a few are pinned so the demo shows every outcome
+# (brazilsouth cannot place D8s_v5 but its pair can; westus is quota-bound; eastasia has no preview API).
+PROBE_OUTCOMES = {"brazilsouth": (2, "InsufficientCapacity", 6), "westus": (6, "InsufficientQuota", 8)}
+probes = []
+for region, (zones, p_reg, _, _) in REGIONS.items():
+    base = max(0, 9 - round(p_reg * 40))
+    for sku, count, _optional in PROFILE_VMS:
+        q = quota_idx.get((region, family_of[(region, sku)]))
+        need = vcpus_of[(region, sku)] * count
+        if sku == "Standard_D8s_v5":
+            score, fulfillment, placed = PROBE_OUTCOMES.get(region, (base, "None", count))
+            if score <= 2 and fulfillment == "None":
+                fulfillment, placed = "InsufficientCapacity", 4 * score
+        else:
+            score, fulfillment, placed = max(1, base - 1), "None", count
+        detail = None
+        if q and (q["limit"] == 0 or q["limit"] - q["current"] < need):  # what the live quota pre-check would say
+            score, fulfillment, placed = None, "InsufficientQuota", 0
+            detail = f"limit {q['limit']}, used {q['current']}, need {need} vCPU"
+        probes.append(make_probe(region, sku, count, score, fulfillment, placed, zones, detail))
 # one region where the preview API is not available, to show how a failed probe renders
-probes[-1].update(score=None, fulfillment=None, split=[], valid_until=None, error="404 No registered resource provider")
+for pr in probes:
+    if pr["region"] == "eastasia" and pr["sku"] == "Standard_D8s_v5":
+        pr.update(score=None, fulfillment=None, split=[], valid_until=None, error="404 No registered resource provider")
 
 out = {
     "meta": {"subscription": "00000000-fixture", "generated": "synthetic"},

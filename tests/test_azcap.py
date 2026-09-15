@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -9,26 +10,38 @@ from pathlib import Path
 import pytest
 
 from azcap import (
+    EXIT_BLOCKED,
     PROBE_API_VERSION,
     FamilySummary,
     ProbeResult,
+    Profile,
+    ProfileVm,
     QuotaRow,
+    RegionVerdict,
     classify,
     diff_against,
     identifier_fingerprint,
+    load_profile,
     nonnegative_int,
     ordered_unique,
     pair_placement_notes,
+    pair_verdict_notes,
     parse_need,
     parse_probe_response,
+    parse_profile,
+    probe_candidates,
     probe_once,
     probe_request_body,
     region_scores,
     run_probes,
     split_summary,
     summarize,
+    workload_verdicts,
     write_html,
 )
+
+FIXTURE = Path(__file__).resolve().parent.parent / "fixtures" / "sample.json"
+WAVE1 = Path(__file__).resolve().parent.parent / "fixtures" / "wave1.yaml"
 
 
 def raw_sku(
@@ -687,3 +700,396 @@ def test_cli_rejects_bad_need_and_mix_without_need(tmp_path: Path) -> None:
     assert bad.returncode == 2 and "SKU:COUNT" in bad.stderr
     bad = subprocess.run([*common, "--need-mix"], capture_output=True, text=True)
     assert bad.returncode == 2 and "--need-mix requires --need" in bad.stderr
+
+
+# --------------------------------------------------------------------------- #
+# Workload profiles and verdicts
+# --------------------------------------------------------------------------- #
+
+VALID_PROFILE = {
+    "name": "wave1",
+    "os": "Windows",
+    "zonal": True,
+    "vms": [{"sku": "Standard_D8s_v5", "count": 12}, {"sku": "Standard_E8s_v5", "count": 4, "optional": True}],
+}
+
+
+def test_parse_profile_accepts_yaml_and_json_and_defaults(tmp_path: Path) -> None:
+    yaml_path = tmp_path / "wave1.yaml"
+    yaml_path.write_text(
+        "name: wave1\nos: Windows\nzonal: true\nvms:\n  - sku: Standard_D8s_v5\n    count: 12\n"
+        "  - sku: Standard_E8s_v5\n    count: 4\n    optional: true\n",
+        encoding="utf-8",
+    )
+    json_path = tmp_path / "wave1.json"
+    json_path.write_text(json.dumps(VALID_PROFILE), encoding="utf-8")
+    expected = Profile(
+        name="wave1",
+        os="Windows",
+        zonal=True,
+        vms=[ProfileVm("Standard_D8s_v5", 12, False), ProfileVm("Standard_E8s_v5", 4, True)],
+    )
+
+    assert load_profile(yaml_path) == expected
+    assert load_profile(json_path) == expected
+    assert load_profile(WAVE1).name == "wave1" and load_profile(WAVE1).zonal is True
+    assert parse_profile({"name": "min", "vms": [{"sku": "Standard_D2_v5", "count": 1}]}) == Profile(
+        name="min", os="Linux", zonal=False, vms=[ProfileVm("Standard_D2_v5", 1, False)]
+    )
+
+
+@pytest.mark.parametrize(
+    ("data", "message"),
+    [
+        (["not", "a", "mapping"], "must be a mapping"),
+        ({**VALID_PROFILE, "region": "eastus"}, "unknown key(s): region"),
+        ({k: v for k, v in VALID_PROFILE.items() if k != "name"}, "'name' is required"),
+        ({**VALID_PROFILE, "name": ""}, "'name' is required"),
+        ({**VALID_PROFILE, "os": "BSD"}, "'os' must be Linux or Windows"),
+        ({**VALID_PROFILE, "zonal": "yes"}, "'zonal' must be true or false"),
+        ({k: v for k, v in VALID_PROFILE.items() if k != "vms"}, "'vms' must be a non-empty list"),
+        ({**VALID_PROFILE, "vms": []}, "'vms' must be a non-empty list"),
+        ({**VALID_PROFILE, "vms": ["Standard_D8s_v5"]}, "vms[1] must be a mapping"),
+        (
+            {**VALID_PROFILE, "vms": [{"sku": "Standard_D8s_v5", "count": 1, "zone": "1"}]},
+            "vms[1] has unknown key(s): zone",
+        ),
+        ({**VALID_PROFILE, "vms": [{"count": 1}]}, "vms[1] 'sku' is required"),
+        ({**VALID_PROFILE, "vms": [{"sku": "Standard D8", "count": 1}]}, "vms[1] 'sku' is required"),
+        ({**VALID_PROFILE, "vms": [{"sku": "Standard_D8s_v5"}]}, "'count' must be an integer of 1 or more"),
+        ({**VALID_PROFILE, "vms": [{"sku": "Standard_D8s_v5", "count": 0}]}, "'count' must be an integer of 1 or more"),
+        ({**VALID_PROFILE, "vms": [{"sku": "Standard_D8s_v5", "count": "12"}]}, "'count' must be an integer"),
+        ({**VALID_PROFILE, "vms": [{"sku": "Standard_D8s_v5", "count": True}]}, "'count' must be an integer"),
+        ({**VALID_PROFILE, "vms": [{"sku": "Standard_D8s_v5", "count": 1, "optional": 1}]}, "'optional' must be true"),
+        (
+            {**VALID_PROFILE, "vms": [{"sku": "Standard_D8s_v5", "count": 1}, {"sku": "standard_d8s_v5", "count": 2}]},
+            "more than once",
+        ),
+    ],
+)
+def test_parse_profile_rejects_bad_profiles(data: object, message: str) -> None:
+    with pytest.raises(ValueError, match=re.escape(message)):
+        parse_profile(data)
+
+
+def test_load_profile_rejects_bad_files(tmp_path: Path) -> None:
+    (tmp_path / "p.toml").write_text("name = 'x'", encoding="utf-8")
+    (tmp_path / "bad.json").write_text("{", encoding="utf-8")
+    (tmp_path / "bad.yaml").write_text("name: [\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="expected a .yaml, .yml or .json"):
+        load_profile(tmp_path / "p.toml")
+    with pytest.raises(ValueError, match="Invalid JSON in profile"):
+        load_profile(tmp_path / "bad.json")
+    with pytest.raises(ValueError, match="Invalid YAML in profile"):
+        load_profile(tmp_path / "bad.yaml")
+    with pytest.raises(ValueError, match="Cannot read profile"):
+        load_profile(tmp_path / "missing.yaml")
+
+
+def scan_row(name: str, region: str = "eastus", **kw):
+    """A classified SKU row with 8 vCPUs in standardDSv5Family and all three zones unless overridden."""
+    raw = raw_sku(name, region=region, family=kw.pop("family", "standardDSv5Family"), **kw)
+    raw["capabilities"] = {"vCPUs": "8", "MemoryGB": "32"}
+    return classify(raw)
+
+
+def test_workload_verdict_precedence_covers_every_status() -> None:
+    zones = ["1", "2", "3"]
+    restriction_in = lambda region, kind, reason, z=None: {  # noqa: E731
+        "type": kind,
+        "reason": reason,
+        "locations": [region],
+        "zones": z or [],
+    }
+    rows = [
+        scan_row(
+            "Standard_R",
+            zones=zones,
+            restrictions=[restriction_in("eastus", "Location", "NotAvailableForSubscription")],
+        ),
+        scan_row(
+            "Standard_Z",
+            zones=zones,
+            restrictions=[restriction_in("eastus", "Zone", "NotAvailableForSubscription", ["1", "2"])],
+        ),
+        scan_row("Standard_Q", zones=zones, family="standardEmptyFamily"),
+        scan_row(
+            "Standard_QID",
+            zones=zones,
+            family="standardQidFamily",
+            restrictions=[restriction_in("eastus", "Location", "QuotaId")],
+        ),
+        scan_row("Standard_C", zones=zones),
+        scan_row("Standard_OK", zones=zones),
+        scan_row("Standard_U", zones=zones),
+        scan_row("Standard_N", zones=[]),
+        scan_row("Standard_P", zones=zones, family="standardPqFamily"),
+    ]
+    quota = [
+        QuotaRow("eastus", "standardDSv5Family", "DSv5", 0, 1000),
+        QuotaRow("eastus", "standardEmptyFamily", "Empty", 0, 0),
+    ]
+    probes = [
+        probe(
+            "eastus",
+            "InsufficientCapacity",
+            sku="Standard_C",
+            count=2,
+            score=3,
+            split=[{"name": "Standard_C", "zone": "1", "capacity": 1, "capacity_max": 1}],
+        ),
+        probe("eastus", "None", sku="Standard_OK", count=2, score=9),
+        probe("eastus", error="404 nope", sku="Standard_U", count=2),
+        probe(
+            "eastus", "InsufficientQuota", sku="Standard_P", count=2, score=None, split=[], detail="standardPqFamily"
+        ),
+    ]
+    vms = [
+        ProfileVm(sku, 2)
+        for sku in (
+            "Standard_R",
+            "Standard_Z",
+            "Standard_Q",
+            "Standard_QID",
+            "Standard_C",
+            "Standard_OK",
+            "Standard_U",
+            "Standard_N",
+            "Standard_X",
+            "Standard_P",
+        )
+    ]
+    zonal = Profile("t", zonal=True, vms=vms)
+
+    [rv] = workload_verdicts(zonal, ["eastus"], rows, quota, probes)
+    by = {v.sku: v for v in rv.vms}
+    assert rv.verdict == "blocked"
+    assert (by["Standard_R"].status, by["Standard_R"].reason) == (
+        "restricted",
+        "region restricted for this subscription",
+    )
+    assert by["Standard_Z"].status == "restricted" and "usable zones: 3" in by["Standard_Z"].reason
+    assert (by["Standard_Q"].status, by["Standard_Q"].reason) == ("quota", "standardEmptyFamily limit 0, need 16 vCPU")
+    assert by["Standard_QID"].status == "quota" and "QuotaId" in by["Standard_QID"].reason
+    assert (by["Standard_C"].status, by["Standard_C"].reason, by["Standard_C"].probe_score) == (
+        "capacity",
+        "score 3, 1 of 2 placed",
+        3,
+    )
+    assert (by["Standard_OK"].status, by["Standard_OK"].reason) == ("deployable", "placed (score 9)")
+    assert by["Standard_U"].status == "unknown" and "404 nope" in by["Standard_U"].reason
+    assert by["Standard_N"].status == "restricted" and "no availability zones" in by["Standard_N"].reason
+    assert by["Standard_X"].status == "not offered"
+    assert by["Standard_P"].status == "quota" and "standardPqFamily" in by["Standard_P"].reason
+    assert by["Standard_OK"].family == "standardDSv5Family" and by["Standard_OK"].vcpu_need == 16
+    assert (by["Standard_OK"].quota_limit, by["Standard_OK"].quota_used) == (1000, 0)
+    assert rv.blocking[0] == "restricted: Standard_R (region restricted for this subscription)"
+    assert len(rv.blocking) == 8
+
+    # only VMs that survive steps 1-3 are worth a probe: C, OK, U (and P, whose quota verdict came from its probe)
+    assert probe_candidates(zonal, ["eastus"], rows, quota) == {
+        "eastus": [("Standard_C", 2), ("Standard_OK", 2), ("Standard_U", 2), ("Standard_P", 2)]
+    }
+
+    # a regional profile: the zone rule no longer applies, so Z and N fall through to the probe (absent -> unknown)
+    regional = Profile("t", zonal=False, vms=[ProfileVm("Standard_Z", 2), ProfileVm("Standard_N", 2)])
+    [rv] = workload_verdicts(regional, ["eastus"], rows, quota, probes)
+    assert [v.status for v in rv.vms] == ["unknown", "unknown"] and rv.verdict == "unknown"
+
+    # deployable region: only placed VMs
+    [rv] = workload_verdicts(Profile("t", vms=[ProfileVm("Standard_OK", 2)]), ["eastus"], rows, quota, probes)
+    assert rv.verdict == "deployable" and rv.blocking == []
+
+
+def test_workload_quota_sums_needs_per_family_and_optional_never_blocks() -> None:
+    rows = [scan_row("Standard_D8s_v5"), scan_row("Standard_D16s_v5"), scan_row("Standard_G")]
+    rows[1].vcpus = 16
+    quota = [QuotaRow("eastus", "standardDSv5Family", "DSv5", 20, 200)]  # 180 free
+    probes = [
+        probe("eastus", "None", sku="Standard_D8s_v5", count=10, score=8),
+        probe("eastus", "None", sku="Standard_D16s_v5", count=5, score=8),
+        probe("eastus", "InsufficientCapacity", sku="Standard_G", count=1, score=1, split=[]),
+    ]
+    # 80 + 80 = 160 fits alone; together with an 80 more they would not, but each alone does
+    fits = Profile("fits", vms=[ProfileVm("Standard_D8s_v5", 10), ProfileVm("Standard_D16s_v5", 5)])
+    [rv] = workload_verdicts(fits, ["eastus"], rows, quota, probes)
+    assert rv.verdict == "deployable"
+
+    # 8*15 + 16*5 = 200 > 180 free: both required VMs are quota-blocked because they share the family
+    probes.append(probe("eastus", "None", sku="Standard_D8s_v5", count=15, score=8))
+    shared = Profile("shared", vms=[ProfileVm("Standard_D8s_v5", 15), ProfileVm("Standard_D16s_v5", 5)])
+    [rv] = workload_verdicts(shared, ["eastus"], rows, quota, probes)
+    assert [v.status for v in rv.vms] == ["quota", "quota"]
+    assert rv.vms[0].reason == "standardDSv5Family limit 200, used 20, need 200 vCPU"
+
+    # an optional VM is checked on top of the required total and can only block itself
+    probes.append(probe("eastus", "None", sku="Standard_D16s_v5", count=10, score=8))
+    optional = Profile(
+        "opt",
+        vms=[
+            ProfileVm("Standard_D8s_v5", 10),
+            ProfileVm("Standard_D16s_v5", 10, optional=True),
+            ProfileVm("Standard_G", 1, optional=True),
+        ],
+    )
+    [rv] = workload_verdicts(optional, ["eastus"], rows, quota, probes)
+    assert rv.verdict == "deployable" and rv.blocking == []
+    assert [(v.sku, v.status) for v in rv.vms] == [
+        ("Standard_D8s_v5", "deployable"),
+        ("Standard_D16s_v5", "quota"),  # 80 required + 160 optional > 180 free
+        ("Standard_G", "capacity"),
+    ]
+
+
+def verdict(region: str, verdict: str, *vms: tuple[str, str]) -> RegionVerdict:
+    rows = [VmVerdict_(region, sku, status) for sku, status in vms]
+    blocking = [
+        f"{v.status}: {v.sku} ({v.reason})"
+        for v in rows
+        if v.status in ("quota", "capacity", "restricted", "not offered")
+    ]
+    return RegionVerdict(region=region, verdict=verdict, blocking=blocking, vms=rows)
+
+
+def VmVerdict_(region: str, sku: str, status: str):
+    from azcap import VmVerdict
+
+    return VmVerdict(region=region, sku=sku, count=1, optional=False, status=status, reason="r")
+
+
+def test_pair_verdict_notes_use_quota_and_capacity_wording() -> None:
+    pairs = [
+        {"region": "a", "pair": "b"},
+        {"region": "c", "pair": "d"},
+        {"region": "e", "pair": "f"},
+        {"region": "g", "pair": "h"},
+        {"region": "i", "pair": "j"},
+        {"region": "k", "pair": None},
+    ]
+    verdicts = [
+        verdict("a", "deployable", ("S", "deployable")),
+        verdict("b", "deployable", ("S", "deployable")),
+        verdict("c", "deployable", ("S", "deployable")),
+        verdict("d", "blocked", ("S", "quota"), ("T", "capacity")),
+        verdict("e", "blocked", ("S", "restricted")),
+        verdict("f", "deployable", ("S", "deployable")),
+        verdict("g", "blocked", ("S", "capacity")),
+        verdict("h", "blocked", ("S", "quota")),
+        verdict("i", "unknown", ("S", "unknown")),
+        verdict("j", "blocked", ("S", "not offered")),
+        verdict("k", "blocked", ("S", "quota")),
+    ]
+    pair_verdict_notes(pairs, verdicts)
+    assert [(p["verdict"], p["pair_verdict"], p["dr_note"]) for p in pairs] == [
+        ("deployable", "deployable", "DR-ready"),
+        ("deployable", "blocked", "pair blocked: quota blocks S; cannot place T"),
+        ("blocked", "deployable", "primary blocked: S restricted"),
+        ("blocked", "blocked", "both blocked — g: cannot place S; pair: quota blocks S"),
+        ("unknown", "blocked", "j blocked: S not offered; i not determined (placement probe unavailable)"),
+        ("blocked", None, ""),
+    ]
+    assert "cannot place" not in pairs[3]["dr_note"].split("pair:")[1]
+
+
+def run_cli(*args: str, out: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "azcap", "--fixture", str(FIXTURE), "--out", str(out), *args],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_cli_profile_writes_verdicts_and_gates_with_exit_codes(tmp_path: Path) -> None:
+    ok = run_cli("--regions", "eastus2,brazilsouth", "--profile", str(WAVE1), out=tmp_path / "a")
+    assert ok.returncode == 0
+    assert 'Workload "wave1" (zonal, Linux):' in ok.stdout
+    rows = list(csv.DictReader((tmp_path / "a" / "verdicts.csv").open(encoding="utf-8", newline="")))
+    assert list(rows[0].keys()) == [
+        "region",
+        "sku",
+        "count",
+        "optional",
+        "status",
+        "reason",
+        "family",
+        "vcpu_need",
+        "quota_limit",
+        "quota_used",
+        "probe_score",
+        "probe_fulfillment",
+        "region_verdict",
+    ]
+    by_region = {
+        r: {row["sku"]: row for row in rows if row["region"] == r}
+        for r in ("eastus2", "centralus", "brazilsouth", "southcentralus")
+    }
+    assert by_region["eastus2"]["Standard_D8s_v5"]["region_verdict"] == "deployable"
+    assert by_region["brazilsouth"]["Standard_D8s_v5"]["status"] == "capacity"
+    assert by_region["brazilsouth"]["Standard_D8s_v5"]["region_verdict"] == "blocked"
+    assert by_region["southcentralus"]["Standard_D8s_v5"]["status"] == "quota"
+    assert by_region["southcentralus"]["Standard_D8s_v5"]["quota_limit"] == "0"
+    assert by_region["centralus"]["Standard_NC24ads_A100_v4"]["status"] == "restricted"
+    assert by_region["centralus"]["Standard_NC24ads_A100_v4"]["optional"] == "True"
+    assert by_region["centralus"]["Standard_NC24ads_A100_v4"]["region_verdict"] == "deployable"
+    raw = json.loads((tmp_path / "a" / "raw.json").read_text(encoding="utf-8"))
+    assert raw["profile"]["name"] == "wave1" and raw["meta"]["profile_name"] == "wave1"
+    assert {v["region"]: v["verdict"] for v in raw["verdicts"]} == {
+        "eastus2": "deployable",
+        "brazilsouth": "blocked",
+        "centralus": "deployable",
+        "southcentralus": "blocked",
+    }
+    # probes are only kept (live: only sent) for VMs undecided after the not-offered/restricted/quota steps
+    probe_rows = list(csv.DictReader((tmp_path / "a" / "probes.csv").open(encoding="utf-8", newline="")))
+    probed = {(r["region"], r["sku"]) for r in probe_rows}
+    assert ("centralus", "Standard_NC24ads_A100_v4") not in probed  # restricted
+    assert ("southcentralus", "Standard_D8s_v5") not in probed  # quota
+    assert ("brazilsouth", "Standard_NC24ads_A100_v4") not in probed  # restricted (optional)
+    assert {
+        ("eastus2", "Standard_D8s_v5"),
+        ("southcentralus", "Standard_E16s_v5"),
+        ("brazilsouth", "Standard_D8s_v5"),
+    } <= probed
+    assert len(probe_rows) == 8
+    pairs = {r["region"]: r for r in csv.DictReader((tmp_path / "a" / "pairs.csv").open(encoding="utf-8", newline=""))}
+    assert pairs["eastus2"]["dr_note"] == "DR-ready"
+    assert pairs["brazilsouth"]["dr_note"].startswith("both blocked")
+    html = (tmp_path / "a" / "report.html").read_text(encoding="utf-8")
+    assert '"verdicts": [' in html and '"profile": {' in html
+
+    # no --fail-on-blocked: exit 0 even though brazilsouth is blocked
+    assert run_cli("--regions", "brazilsouth", "--profile", str(WAVE1), out=tmp_path / "b").returncode == 0
+    blocked = run_cli(
+        "--regions", "eastus2,brazilsouth", "--profile", str(WAVE1), "--fail-on-blocked", out=tmp_path / "c"
+    )
+    assert blocked.returncode == EXIT_BLOCKED and "brazilsouth" in blocked.stderr.splitlines()[-1]
+    # the auto-added pair (southcentralus) is blocked but only primaries gate without --require-pair
+    fine = run_cli("--regions", "eastus2", "--profile", str(WAVE1), "--fail-on-blocked", out=tmp_path / "d")
+    assert fine.returncode == 0
+    gpu = tmp_path / "gpu.json"
+    gpu.write_text(json.dumps({"name": "gpu", "zonal": True, "vms": [{"sku": "Standard_NC24ads_A100_v4", "count": 1}]}))
+    assert (
+        run_cli("--regions", "eastus2", "--profile", str(gpu), "--fail-on-blocked", out=tmp_path / "e").returncode == 0
+    )
+    pair_gate = run_cli(
+        "--regions", "eastus2", "--profile", str(gpu), "--fail-on-blocked", "--require-pair", out=tmp_path / "f"
+    )
+    assert pair_gate.returncode == EXIT_BLOCKED and "centralus" in pair_gate.stderr.splitlines()[-1]
+
+    # stale verdicts.csv is removed on a run without a profile
+    assert (tmp_path / "a" / "verdicts.csv").exists()
+    assert run_cli("--regions", "eastus2", out=tmp_path / "a").returncode == 0
+    assert not (tmp_path / "a" / "verdicts.csv").exists()
+
+
+def test_cli_profile_argument_rules(tmp_path: Path) -> None:
+    both = run_cli("--regions", "eastus2", "--profile", str(WAVE1), "--need", "Standard_D8s_v5:1", out=tmp_path)
+    assert both.returncode == 2 and "mutually exclusive" in both.stderr
+    no_profile = run_cli("--regions", "eastus2", "--fail-on-blocked", out=tmp_path)
+    assert no_profile.returncode == 2 and "--fail-on-blocked requires --profile" in no_profile.stderr
+    no_gate = run_cli("--regions", "eastus2", "--profile", str(WAVE1), "--require-pair", out=tmp_path)
+    assert no_gate.returncode == 2 and "--require-pair requires --fail-on-blocked" in no_gate.stderr
+    bad = tmp_path / "bad.yaml"
+    bad.write_text("name: x\nvms: []\n", encoding="utf-8")
+    invalid = run_cli("--regions", "eastus2", "--profile", str(bad), out=tmp_path)
+    assert invalid.returncode == 2 and "'vms' must be a non-empty list" in invalid.stderr

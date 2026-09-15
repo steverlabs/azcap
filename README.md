@@ -73,6 +73,9 @@ azcap --regions eastus --redact-identifiers
 # ask whether 12 x Standard_D8s_v5 would place across zones in each region right now
 azcap --regions eastus2,brazilsouth --zonal --need Standard_D8s_v5:12
 
+# judge each region against a workload profile; exit 3 if a requested region is blocked
+azcap --regions eastus2 --profile fixtures/wave1.yaml --fail-on-blocked
+
 # offline / demo with synthetic data
 python fixtures/make_fixture.py   # generates fixtures/sample.json
 azcap --regions eastus,brazilsouth,saudiarabiaeast --fixture fixtures/sample.json
@@ -82,11 +85,12 @@ Outputs land in `--out` (default `out/`):
 
 | file | contents |
 |---|---|
-| `report.html` | heatmap (region × family), paired regions, placement probes, zone-level restrictions, quota headroom, changes, filterable SKU table |
+| `report.html` | heatmap (region × family), paired regions, workload verdict, placement probes, zone-level restrictions, quota headroom, changes, filterable SKU table |
 | `summary.csv` | one row per region × family with counts, assessed count, and zone-adjusted % restricted |
 | `skus.csv` | one row per region × SKU with status, zones, reason codes |
-| `pairs.csv` | one row per requested region: pair, geography match, zone support, both-side scores, placement notes |
-| `probes.csv` | with `--need`: one row per region × placement probe — score, result, quota detail, SKU/zone split |
+| `pairs.csv` | one row per requested region: pair, geography match, zone support, both-side scores, placement notes, verdicts and DR note |
+| `probes.csv` | with `--need` or `--profile`: one row per region × placement probe — score, result, quota detail, SKU/zone split |
+| `verdicts.csv` | with `--profile`: one row per region × profile VM — status, reason, family, vCPU need, quota, probe score, region verdict |
 | `quota.csv` | with `--include-quota`: used vs limit per family |
 | `raw.json` | normalized API snapshot — keep it, pass as `--compare` next run |
 
@@ -173,6 +177,81 @@ Placement probes (regular VMs, Linux; Compute Recommender preview):
   canadacentral          Standard_D8s_v5 x12   zonal   score -  insufficient quota: standardDSv5Family
 ```
 
+## Workload profiles
+
+`--profile PATH` turns the scan into a per-region verdict for a specific deployment: can this workload go
+here, and if not, what stops it. The profile is a small YAML (or JSON, same keys) file:
+
+```yaml
+name: wave1                       # required; appears in labels
+os: Linux                         # Linux | Windows (default Linux); sent with the placement probes
+zonal: true                       # default false; true = the design must be zone-resilient
+vms:                              # required, at least one
+  - sku: Standard_D8s_v5          # exact SKU name
+    count: 12                     # integer >= 1
+  - sku: Standard_NC24ads_A100_v4
+    count: 1
+    optional: true                # default false; optional VMs are reported but never block
+```
+
+Unknown keys, missing fields, wrong types, an empty `vms`, and duplicate SKUs are rejected up front.
+`--profile` implies `--include-quota` and a placement probe for each VM that is not already decided by
+steps 1–3 below (so it cannot be combined with `--need`); the profile's `zonal` controls the probe zones
+and the zone check, while `--zonal` still only narrows the restriction scan.
+
+Every scanned region — pairs included — gets a verdict. For each VM the first of these that applies
+wins:
+
+1. **not offered** — the SKU is absent from the region's SKU list for this subscription.
+2. **restricted** — region-restricted; or, for a zonal profile, fewer than two usable zones (a SKU
+   blocked in all but one zone cannot be placed zone-resiliently), including regions with no zones.
+3. **quota** — the family's vCPU quota is 0, or the free vCPUs are fewer than the profile needs.
+   Needs are summed per family across the profile's required VMs before checking, since two SKUs
+   in the same family share one quota; an optional VM is checked on top of that total.
+4. **capacity** — the placement probe could not place the request (`InsufficientCapacity`).
+5. **deployable** — the probe placed it. If the probe failed (preview API error) the VM is
+   **unknown**: restrictions and quota allow it, but capacity could not be checked.
+
+A region is **deployable** only when every required VM is deployable, **blocked** when any required VM
+hits 1–4 (the blocking VMs and reasons are listed), and **unknown** when nothing blocks but a probe
+failed. Optional VMs show their own status with an "(optional)" mark and never change the region
+verdict. Paired regions get a DR note: `DR-ready`, `pair blocked: …`, `primary blocked: …`, or
+`both blocked …`, using the same wording as the placement notes (quota is "quota blocks X", never
+"cannot place").
+
+Exit codes, for gating a pipeline:
+
+| code | meaning |
+|---|---|
+| 0 | finished; verdicts are informational unless `--fail-on-blocked` is set |
+| 1 | could not run: authentication, Azure request, or invalid input/fixture/profile |
+| 2 | usage error |
+| 3 | `--fail-on-blocked` and a requested region is blocked (with `--require-pair`: or its paired region is) |
+
+```bash
+# refuse to deploy wave 1 unless eastus2 can take it right now
+azcap --regions eastus2 --profile wave1.yaml --fail-on-blocked || exit 1
+
+# the same, but the DR pair must be deployable too
+azcap --regions eastus2 --profile wave1.yaml --fail-on-blocked --require-pair || exit 1
+```
+
+Console output, one line per region (the offline demo: `--fixture fixtures/sample.json --profile fixtures/wave1.yaml`):
+
+```
+Workload "wave1" (zonal, Linux):
+  eastus2                deployable  D8s_v5 x12 placed (score 9), E16s_v5 x4 placed (score 8), NC24ads_A100_v4 x1 placed (score 8) (optional)
+                                     pair: DR-ready
+  brazilsouth            BLOCKED     capacity: Standard_D8s_v5 (score 2, 6 of 12 placed); optional: NC24ads_A100_v4 restricted
+                                     pair: both blocked — brazilsouth: cannot place Standard_D8s_v5; pair: quota blocks Standard_D8s_v5
+  centralus              deployable  D8s_v5 x12 placed (score 7), E16s_v5 x4 placed (score 6), NC24ads_A100_v4 x1 restricted (optional)  (pair of eastus2)
+  southcentralus         BLOCKED     quota: Standard_D8s_v5 (standardDSv5Family limit 0, need 96 vCPU)  (pair of brazilsouth)
+```
+
+A verdict is as good as its inputs: restrictions and quota are current, but a placement score is a
+hypothetical allocation at the time of the run, not a reservation. Use it to pick and gate, then
+reserve capacity if the deployment cannot tolerate `AllocationFailed`.
+
 ## Caveats
 
 - Everything here is **per subscription**. Restrictions can differ from one subscription to another,
@@ -201,6 +280,9 @@ ruff format --check .
 pytest
 python -m build
 ```
+
+`python fixtures/make_fixture.py` regenerates `fixtures/sample.json` and `fixtures/wave1.yaml`; the
+fixture pins eastus2 / centralus / brazilsouth / southcentralus so a profile run shows every verdict.
 
 ## Extending
 

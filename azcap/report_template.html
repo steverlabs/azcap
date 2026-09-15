@@ -77,6 +77,15 @@
   .pill.insufficient_quota::before { border-style: dashed; }
   .pill.error, .pill.unknown { color: var(--text-3); }
   .pill.error::before, .pill.unknown::before { border-style: dotted; }
+  /* workload verdicts: region (deployable / blocked) and per-VM (restricted / quota / capacity / not offered) */
+  .pill.deployable { color: var(--text-2); }
+  .pill.deployable::before { border-color: var(--text-3); }
+  .pill.blocked { font-weight: 600; }
+  .pill.blocked::before, .pill.restricted::before { background: var(--text); border-color: var(--text); }
+  .pill.quota::before { border-style: dashed; }
+  .pill.capacity::before { background: var(--text-2); border-color: var(--text-2); clip-path: inset(0 50% 0 0); }
+  .pill.not_offered { color: var(--text-3); }
+  .pill.not_offered::before { border-style: dotted; }
   .controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 10px; }
   .controls input, .controls select { font: inherit; padding: 5px 8px; border: 1px solid var(--line);
                                        border-radius: 6px; background: var(--panel); color: var(--text); }
@@ -118,6 +127,13 @@
       are newer regions Microsoft launched unpaired; DR there is a region you choose, not a pair.</p>
     <div class="scroll"><table id="pairs"></table></div>
     <div id="pairFam"></div>
+  </div>
+
+  <div id="verdictBlock" hidden>
+    <h2>Workload verdict</h2>
+    <p class="note" id="verdictNote"></p>
+    <div class="scroll"><table id="verdicts"></table></div>
+    <div id="verdictVms"></div>
   </div>
 
   <div id="probesBlock" hidden>
@@ -195,6 +211,7 @@ function seqInk(score) {
     (m.sku_glob ? ` · sku <code>${esc(m.sku_glob)}</code>` : "") +
     (m.exclude_families?.length ? ` · excluding <code>${esc(m.exclude_families.join(", "))}</code>` : "") +
     (m.zonal_only ? ` · <b>zonal SKUs only</b>` : "") +
+    (m.profile_name ? ` · workload <code>${esc(m.profile_name)}</code>` : "") +
     (m.need?.length ? ` · placement probes <code>${esc(m.need.map(n => n.sku + " x" + n.count).join(", "))}</code>${m.need_mix ? " as one mix" : ""}${m.probe_spot ? " (spot)" : ""} on ${esc(m.probe_os ?? "Linux")}` : "") +
     ` · region weighting <code>${esc(m.region_weighting ?? "sku")}</code>` +
     (m.identifiers_redacted ? ` · <b>identifiers redacted</b>` : "") +
@@ -285,6 +302,7 @@ function seqInk(score) {
       if (p.pair_has_data === false) flags.push("no SKUs evaluated in pair (filtered out)");
       if (p.both_constrained.length) flags.push("both constrained: " + p.both_constrained.join(", "));
       if (p.placement_notes?.length) flags.push(...p.placement_notes);
+      if (p.dr_note) flags.push(p.dr_note);
     }
     h += `<tr><th class="rowh">${esc(p.region)}</th><td>${esc(p.geography ?? "")}</td><td>${p.zonal ? "yes" : "no"}</td>${cell(p.score)}` +
          `<td>${esc(p.pair ?? "—")}</td><td>${esc(p.pair_geography ?? "")}</td><td>${p.pair ? (p.pair_zonal ? "yes" : "no") : ""}</td>${cell(p.pair_score)}` +
@@ -307,6 +325,47 @@ function seqInk(score) {
     f += `</tbody></table></div>`;
   }
   $("#pairFam").innerHTML = f;
+})();
+
+// ---- workload verdict
+(function () {
+  const V = DATA.verdicts || [], prof = DATA.profile;
+  if (!V.length || !prof) return;
+  $("#verdictBlock").hidden = false;
+  const vmList = prof.vms.map(v => `${esc(v.sku)} ×${v.count}${v.optional ? " (optional)" : ""}`).join(", ");
+  $("#verdictNote").innerHTML = `Workload <b>${esc(prof.name)}</b> — ${vmList}; ${prof.zonal ? "zone-resilient placement required" : "regional placement"}, ${esc(prof.os)}.
+    Each VM gets the first verdict that applies: <b>not offered</b> (SKU absent from the region), <b>restricted</b> (region-restricted, or too few usable zones for a zonal design),
+    <b>quota</b> (family vCPU quota cannot hold the profile's total need), <b>capacity</b> (placement probe could not place it), else <b>deployable</b>.
+    A region is deployable only when every required VM is; optional VMs are shown but never block. A failed probe leaves a VM <b>unknown</b>, which does not block either.`;
+  const pillFor = s => `<span class="pill ${esc(s.replace(" ", "_"))}">${esc(s)}</span>`;
+  const drOf = {}; (DATA.pairs || []).forEach(p => drOf[p.region] = p);
+  let h = `<thead><tr><th>region</th><th>verdict</th><th>why</th><th>paired region</th><th>pair verdict</th><th>DR note</th></tr></thead><tbody>`;
+  for (const rv of V) {
+    const pairOf = DATA.meta.pair_of?.[rv.region];
+    const optionalFailing = rv.vms.filter(v => v.optional && ["not offered","restricted","quota","capacity"].includes(v.status));
+    const why = rv.verdict === "blocked" ? rv.blocking.join("; ")
+      : rv.vms.filter(v => !v.optional).map(v => `${esc(v.sku)} ${v.status === "deployable" ? esc(v.reason) : esc(v.status)}`).join(", ");
+    const opt = optionalFailing.length ? ` · optional: ${optionalFailing.map(v => esc(v.sku) + " " + esc(v.status)).join(", ")}` : "";
+    const pr = drOf[rv.region];
+    h += `<tr><th class="rowh">${pairOf ? "↳ " : ""}${esc(rv.region)}${pairOf ? ` <span class="warn" style="font-weight:400">· pair of ${esc(pairOf)}</span>` : ""}</th>` +
+         `<td>${pillFor(rv.verdict)}</td><td style="white-space:normal;min-width:260px">${rv.verdict === "blocked" ? esc(why) : why}${opt}</td>` +
+         `<td>${pr ? esc(pr.pair ?? "—") : ""}</td><td>${pr?.pair_verdict ? pillFor(pr.pair_verdict) : ""}</td>` +
+         `<td class="warn" style="white-space:normal;min-width:220px">${esc(pr?.dr_note ?? "")}</td></tr>`;
+  }
+  $("#verdicts").innerHTML = h + "</tbody>";
+
+  let f = "";
+  for (const rv of V) {
+    f += `<h2 style="font-size:13px;margin:16px 0 6px">${esc(rv.region)} — ${esc(prof.name)} by VM</h2>
+          <div class="scroll"><table><thead><tr><th>sku</th><th class="num">count</th><th>status</th><th>reason</th><th class="num">score (0–9)</th><th>family</th><th class="num">vCPU need</th><th class="num">quota limit</th><th class="num">quota used</th></tr></thead><tbody>`;
+    for (const v of rv.vms) {
+      f += `<tr><td>${esc(v.sku)}${v.optional ? ` <span class="warn">(optional)</span>` : ""}</td><td class="num">${v.count}</td><td>${pillFor(v.status)}</td>` +
+           `<td style="white-space:normal;min-width:260px">${esc(v.reason)}</td><td class="num">${v.probe_score ?? "—"}</td><td>${esc(v.family ?? "")}</td>` +
+           `<td class="num">${v.vcpu_need ?? ""}</td><td class="num">${v.quota_limit ?? ""}</td><td class="num">${v.quota_used ?? ""}</td></tr>`;
+    }
+    f += `</tbody></table></div>`;
+  }
+  $("#verdictVms").innerHTML = f;
 })();
 
 // ---- placement probes

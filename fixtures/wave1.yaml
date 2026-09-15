@@ -1,0 +1,12 @@
+# azcap workload profile: what wave 1 needs in a region before it can deploy there.
+name: wave1
+os: Linux
+zonal: true                     # the design is zone-resilient, so placement is judged across zones
+vms:
+  - sku: Standard_D8s_v5
+    count: 12
+  - sku: Standard_E16s_v5
+    count: 4
+  - sku: Standard_NC24ads_A100_v4
+    count: 1
+    optional: true              # reported, never blocks the verdict
