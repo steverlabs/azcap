@@ -2,7 +2,7 @@
 
 Microsoft does not publish per-region capacity. What it does expose, per subscription, is the
 set of VM SKUs currently marked unavailable in each region and zone — via the Resource SKUs API
-(`az vm list-skus`). This tool reports the share of VM SKUs that are restricted, per region ×
+(`az vm list-skus`). This tool reports the zone-adjusted share of VM SKUs that are restricted, per region ×
 VM family, and renders a self-contained HTML report you can drop into a deck. Restrictions are a
 subscription-specific availability proxy, not a published Azure capacity percentage or an allocation guarantee.
 
@@ -77,7 +77,7 @@ Outputs land in `--out` (default `out/`):
 | file | contents |
 |---|---|
 | `report.html` | heatmap (region × family), zone-level restrictions, quota headroom, changes, filterable SKU table |
-| `summary.csv` | one row per region × family with counts, assessed count, and % restricted |
+| `summary.csv` | one row per region × family with counts, assessed count, and zone-adjusted % restricted |
 | `skus.csv` | one row per region × SKU with status, zones, reason codes |
 | `pairs.csv` | one row per requested region: pair, geography match, zone support, both-side scores |
 | `quota.csv` | with `--include-quota`: used vs limit per family |
@@ -92,13 +92,14 @@ Outputs land in `--out` (default `out/`):
 | `quota_blocked` | `QuotaId` | A quota or subscription-eligibility restriction. Not assessed (excluded from % restricted); use `--include-quota` to inspect the reported family limit and usage. |
 | `available` | — | No restriction. Does not guarantee allocation at deploy time. |
 
-**The figure is % of assessed SKUs restricted (0–100).** Per region × family it is the mean restriction
-loss across assessed SKUs, where a region-restricted SKU counts 1.0 and a zone-restricted SKU
+**The figure is the zone-adjusted % of assessed SKUs restricted (0–100).** Per region × family it is the mean
+restriction loss across assessed SKUs, where a region-restricted SKU counts 1.0 and a zone-restricted SKU
 counts `blocked_zones / total_zones`; × 100. Quota-blocked SKUs are not assessed. If none remain, the
 figure is `n/a`, not zero.
 
-The region figure is weighted by assessed SKU count by default, so it is literally the share of
-assessed SKUs in that region that are restricted; families with more enumerated sizes have more
+"Zone-adjusted" because a SKU blocked in one of three zones counts 0.33, not 1: the figure is lower than a
+plain count of SKUs carrying any restriction (the region-restricted and zone-restricted counts are shown
+alongside it). The region figure is weighted by assessed SKU count by default; families with more enumerated sizes have more
 influence. Use `--region-weighting family` to weight every assessed
 family equally (the figure is then an average of family rates, no longer a share of SKUs — the report
 header shows which weighting was used), and use `--families` / `--sku` to make the scope resemble the

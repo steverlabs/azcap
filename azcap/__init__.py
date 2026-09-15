@@ -20,8 +20,8 @@ What the signals mean
                      % restricted figure.
   available          No restrictions.
 
-% restricted per region x family
---------------------------------
+Zone-adjusted % restricted per region x family
+----------------------------------------------
   For each SKU: loss = 1.0 if region_restricted
                      = blocked_zones / total_zones if zone_restricted
                      = 0 otherwise
@@ -686,7 +686,7 @@ Reads the Resource SKUs API (what `az vm list-skus` shows) for each region and r
 of VM SKUs that are restricted for THIS subscription — per region, per family, and per
 availability zone — plus the same view for each region's paired region.
 
-  % restricted = share of assessed SKUs restricted   0 = none, 100 = all
+  zone-adjusted % restricted   0 = no assessed SKU restricted, 100 = all restricted
     region-restricted SKU  -> counts fully      (NotAvailableForSubscription @ Location)
     zone-restricted SKU    -> fraction of zones blocked, e.g. 1 of 3 = 0.33
     quota-blocked SKU      -> reported, but not assessed (offer/quota eligibility, not capacity)
@@ -824,10 +824,17 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
         if not isinstance(fx.get("locations", {}), dict):
             sys.exit(f"Invalid fixture {args.fixture}: 'locations' must be an object")
         locs = fx.get("locations", {})
+        if any(not isinstance(r, dict) or "region" not in r for r in fx["skus"]):
+            sys.exit(f"Invalid record in fixture {args.fixture}: every SKU must be an object with a 'region'")
+        present = set(locs) | {str(r["region"]).lower() for r in fx["skus"]}
+        unknown = [r for r in primaries if r not in present]
+        for r in unknown:
+            print(f"  ! {r}: not in fixture {args.fixture} — skipped", file=sys.stderr)
+        primaries = [r for r in primaries if r in present]
+        if not primaries:
+            sys.exit(f"None of the requested regions are in fixture {args.fixture}.")
         regions, added = (primaries, {}) if args.no_pairs else expand_with_pairs(primaries, locs)
         try:
-            if any(not isinstance(r, dict) or "region" not in r for r in fx["skus"]):
-                raise ValueError("every SKU must be an object with a 'region'")
             raw = [r for r in fx["skus"] if r["region"] in regions]
             if args.include_quota:
                 quota_values = fx.get("quota", [])
@@ -838,7 +845,6 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
             sys.exit(f"Invalid record in fixture {args.fixture}: {e}")
         fx_meta = fx.get("meta") if isinstance(fx.get("meta"), dict) else {}
         subscription = str(fx_meta.get("subscription", "fixture"))
-        unknown: list[str] = []
         subinfo = {
             "subscription_name": fx_meta.get("subscription_name", "synthetic fixture"),
             "tenant_id": str(fx_meta.get("tenant_id", "fixture")),
@@ -933,7 +939,7 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
         "identifiers_redacted": bool(args.redact_identifiers),
         "regions": regions,
         "primaries": primaries,
-        "not_visible": unknown if not args.fixture else [],
+        "not_visible": unknown,
         "pair_of": added,
         "families": families,
         "exclude_families": exclude,
@@ -1011,7 +1017,7 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
     write_html(out, rows, summ, quota, changes, meta, pairs, locs)
 
     # console summary
-    print(f"\n% of assessed VM SKUs restricted for this subscription ({args.region_weighting}-weighted):")
+    print(f"\nZone-adjusted % of assessed VM SKUs restricted for this subscription ({args.region_weighting}-weighted):")
     for region in regions:
         n = sum(1 for r in rows if r.region == region)
         rr = sum(1 for r in rows if r.region == region and r.status == "region_restricted")

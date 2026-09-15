@@ -86,16 +86,16 @@
 <div class="wrap">
   <h1>Azure VM SKU restrictions</h1>
   <div class="meta" id="meta"></div>
-  <p class="note">Every figure is the <b>% of assessed VM SKUs that are restricted</b> for this subscription: 0 = none,
-    100 = all. A region-restricted SKU counts fully; a zone-restricted SKU counts as the fraction of its zones blocked (1 of 3
-    zones = 0.33). The region figure averages families by assessed SKU count (or equally, with family weighting — shown above).
+  <p class="note">Every figure is the <b>zone-adjusted % of assessed VM SKUs that are restricted</b> for this subscription:
+    0 = none, 100 = all. A region-restricted SKU counts fully; a zone-restricted SKU counts as the fraction of its zones blocked
+    (1 of 3 zones = 0.33), so the figure is lower than a plain head-count of SKUs carrying any restriction. The region figure averages families by assessed SKU count (or equally, with family weighting — shown above).
     Quota-blocked SKUs are a quota or subscription-eligibility signal, so they are not assessed; a family or region with no
     assessed SKUs shows n/a. Restrictions are a subscription-specific availability proxy, not a published Azure capacity
     figure, and do not guarantee deployment-time allocation.</p>
 
   <div class="tiles" id="tiles"></div>
 
-  <h2>% restricted by region × family</h2>
+  <h2>Zone-adjusted % restricted by region × family</h2>
   <div class="controls">
     <label class="warn"><input type="checkbox" id="hideZero" checked> hide families with no restrictions anywhere</label>
     <span class="warn" id="heatCount"></span>
@@ -212,7 +212,7 @@ function seqInk(score) {
   const hide = $("#hideZero").checked;
   const fams = hide ? allFams.filter(f => maxBy[f] == null || maxBy[f] > 0) : allFams;
   $("#heatCount").textContent = `${fams.length} of ${allFams.length} families · sorted by worst score`;
-  let h = `<thead><tr><th>region · % restricted</th>${fams.map(f => `<th class="num">${esc(f)}</th>`).join("")}</tr></thead><tbody>`;
+  let h = `<thead><tr><th>region · zone-adjusted % restricted</th>${fams.map(f => `<th class="num">${esc(f)}</th>`).join("")}</tr></thead><tbody>`;
   for (const r of regions) {
     const pairOf = DATA.meta.pair_of?.[r];
     h += `<tr><th class="rowh">${pairOf ? "↳ " : ""}${esc(r)}<span class="rs">${DATA.regionScores[r] != null ? esc(DATA.regionScores[r]) + "% restricted" : "n/a"}${pairOf ? ` · pair of ${esc(pairOf)}` : ""}</span></th>`;
@@ -231,7 +231,7 @@ function seqInk(score) {
   }
   $("#hideZero").addEventListener("change", render);
   render();
-  $("#legend").innerHTML = `<span style="white-space:nowrap">0% restricted</span> ` + [0,10,25,40,55,70,85,100].map(v => `<span class="sw" style="background:${seqVar(v)}"></span>`).join("") + ` <span style="white-space:nowrap">100% restricted</span> · cell = % of that family's assessed SKUs restricted in that region · dashed n/a = no assessed SKUs · row label = ${esc(DATA.meta.region_weighting ?? "sku")}-weighted average`;
+  $("#legend").innerHTML = `<span style="white-space:nowrap">0% restricted</span> ` + [0,10,25,40,55,70,85,100].map(v => `<span class="sw" style="background:${seqVar(v)}"></span>`).join("") + ` <span style="white-space:nowrap">100% restricted</span> · cell = zone-adjusted % of that family's assessed SKUs restricted in that region · dashed n/a = no assessed SKUs · row label = ${esc(DATA.meta.region_weighting ?? "sku")}-weighted average`;
 
   const tip = $("#tip");
   $("#heat").addEventListener("mousemove", e => {
@@ -257,8 +257,8 @@ function seqInk(score) {
   const fmt = v => v == null ? "—" : Number(v).toFixed(1);
   const cell = v => v == null ? `<td class="num">—</td>` :
     `<td class="num" style="background:${seqVar(v)};color:${seqInk(v)}">${fmt(v)}</td>`;
-  let h = `<thead><tr><th>region</th><th>geography</th><th>zones</th><th class="num">% restricted</th>
-           <th>paired region</th><th>pair geography</th><th>pair zones</th><th class="num">pair % restricted</th><th>flags</th></tr></thead><tbody>`;
+  let h = `<thead><tr><th>region</th><th>geography</th><th>zones</th><th class="num">zone-adj. % restricted</th>
+           <th>paired region</th><th>pair geography</th><th>pair zones</th><th class="num">pair zone-adj. % restricted</th><th>flags</th></tr></thead><tbody>`;
   for (const p of P) {
     const flags = [];
     if (!p.pair) flags.push("no paired region");

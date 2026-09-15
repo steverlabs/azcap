@@ -246,3 +246,27 @@ def test_small_cli_helpers() -> None:
     assert nonnegative_int("0") == 0
     with pytest.raises(Exception, match="zero or greater"):
         nonnegative_int("-1")
+
+
+def test_cli_reports_regions_missing_from_fixture(tmp_path: Path) -> None:
+    fixture = {"locations": {"eastus": {"pair": None, "zonal": True}}, "skus": [raw_sku("Standard_D2_v5")]}
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+    common = [sys.executable, "-m", "azcap", "--no-pairs", "--fixture", str(fixture_path)]
+
+    result = subprocess.run(
+        [*common, "--regions", "eastus,nowhere", "--out", str(tmp_path / "out")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    raw = json.loads((tmp_path / "out" / "raw.json").read_text(encoding="utf-8"))
+    assert "nowhere: not in fixture" in result.stderr
+    assert raw["meta"]["not_visible"] == ["nowhere"]
+    assert raw["meta"]["regions"] == ["eastus"]
+
+    failed = subprocess.run(
+        [*common, "--regions", "nowhere", "--out", str(tmp_path / "out2")], capture_output=True, text=True
+    )
+    assert failed.returncode != 0
+    assert "None of the requested regions" in failed.stderr
