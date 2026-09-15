@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Azure Region Saturation</title>
+<title>Azure VM SKU Restriction Pressure</title>
 <style>
   :root {
     color-scheme: light;
@@ -58,6 +58,7 @@
              display: flex; align-items: center; justify-content: center;
              font-variant-numeric: tabular-nums; font-size: 12px; cursor: default; }
   .heat .c.empty { background: transparent; color: var(--text-3); }
+  .heat .c.na { background: transparent; color: var(--text-3); border: 1px dashed var(--line); }
   .heat th.rowh { font-weight: 600; color: var(--text); }
   .heat th.rowh .rs { color: var(--text-2); font-weight: 400; margin-left: 6px; }
   .legend { display: flex; align-items: center; gap: 6px; margin: 10px 0 0; color: var(--text-2); font-size: 12px; }
@@ -83,17 +84,17 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>Azure region saturation — VM SKUs</h1>
+  <h1>Azure VM SKU restriction pressure</h1>
   <div class="meta" id="meta"></div>
-  <p class="note">Every number in this report is a <b>percentage of VM SKUs withheld</b> from <em>this subscription</em>:
-    0 = every SKU is allocatable, 100 = none are. A region-restricted SKU counts as fully withheld; a zone-restricted SKU counts
-    as the fraction of its zones blocked (1 of 3 zones = 0.33). The region figure is the SKU-weighted average across all
-    families scanned, so a region at 4.2 has 4.2% of its SKU surface withheld. Quota-blocked SKUs (family has zero quota) are a subscription signal, not capacity, and are
-    scored separately. Subscription-specific: results can differ from the customer's tenant.</p>
+  <p class="note">The score is a <b>comparative restriction-pressure index</b>, not a published Azure capacity percentage:
+    0 = no restrictions among assessed SKUs, 100 = fully restricted. A region-restricted SKU counts fully; a zone-restricted SKU
+    counts as the fraction of its zones blocked (1 of 3 zones = 0.33). The region figure aggregates family scores using the
+    weighting shown above. Quota-blocked SKUs are a quota or subscription-eligibility signal, so they are excluded; a family or
+    region with no assessable SKUs is shown as n/a. Results are subscription-specific and do not guarantee deployment-time allocation.</p>
 
   <div class="tiles" id="tiles"></div>
 
-  <h2>Saturation by region × family</h2>
+  <h2>Restriction pressure by region × family</h2>
   <div class="controls">
     <label class="warn"><input type="checkbox" id="hideZero" checked> hide families with no restrictions anywhere</label>
     <span class="warn" id="heatCount"></span>
@@ -104,7 +105,7 @@
   <div id="pairsBlock" hidden>
     <h2>Paired regions</h2>
     <p class="note">Each requested region against its Microsoft-designated pair (from the Subscriptions API). "Both constrained"
-      lists families with ≥ 50% of SKUs withheld on both sides — no DR headroom for that family. Cross-geography pairs and pairs without
+      lists families with a restriction-pressure score ≥ 50 on both sides. Cross-geography pairs and pairs without
       availability zones are flagged because they matter for residency and for zone-resilient DR designs. Regions with no pair
       are newer regions Microsoft launched unpaired; DR there is a region you choose, not a pair.</p>
     <div class="scroll"><table id="pairs"></table></div>
@@ -177,16 +178,20 @@ function seqInk(score) {
     (m.sku_glob ? ` · sku <code>${esc(m.sku_glob)}</code>` : "") +
     (m.exclude_families?.length ? ` · excluding <code>${esc(m.exclude_families.join(", "))}</code>` : "") +
     (m.zonal_only ? ` · <b>zonal SKUs only</b>` : "") +
-    (m.not_visible?.length ? `<br><b>Not visible to this subscription (skipped):</b> <code>${esc(m.not_visible.join(", "))}</code> — region not enabled for this subscription or misspelled` : "");
+    ` · region weighting <code>${esc(m.region_weighting ?? "sku")}</code>` +
+    (m.identifiers_redacted ? ` · <b>identifiers redacted</b>` : "") +
+    (m.not_visible?.length ? `<br><b>Not visible to this subscription (skipped):</b> <code>${esc(m.not_visible.join(", "))}</code> — region not enabled for this subscription or misspelled` : "") +
+    (m.compare_notes?.length ? `<br><b>Baseline notes:</b> ${esc(m.compare_notes.join("; "))}` : "");
   const skus = DATA.skus;
   const by = k => skus.filter(s => s.status === k).length;
-  const worst = Object.entries(DATA.regionScores).sort((a,b)=>b[1]-a[1])[0];
+  const assessedRegions = Object.entries(DATA.regionScores).filter(([,v]) => v != null);
+  const worst = assessedRegions.sort((a,b)=>b[1]-a[1])[0];
   const tiles = [
     ["VM SKUs scanned", skus.length, `${m.regions.length} region(s)`],
     ["Region-restricted", by("region_restricted"), "NotAvailableForSubscription @ Location"],
     ["Zone-restricted", by("zone_restricted"), "NotAvailableForSubscription @ Zone"],
     ["Quota-blocked", by("quota_blocked"), "QuotaId — not a capacity signal"],
-    ["Most withheld region", worst ? worst[0] : "—", worst ? `${worst[1]}% of SKUs withheld` : ""],
+    ["Highest-pressure region", worst ? worst[0] : "—", worst ? `${worst[1]} restriction-pressure score` : "no assessable SKUs"],
   ];
   $("#tiles").innerHTML = tiles.map(([k,v,s]) => `<div class="tile"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div><div class="s">${esc(s)}</div></div>`).join("");
 })();
@@ -195,20 +200,29 @@ function seqInk(score) {
 (function () {
   const regions = DATA.meta.regions;
   const idx = {}; DATA.summary.forEach(s => idx[s.region + "|" + s.family] = s);
-  const maxBy = {}; DATA.summary.forEach(s => maxBy[s.family] = Math.max(maxBy[s.family] ?? 0, s.score));
-  const allFams = Object.keys(maxBy).sort((a,b) => (maxBy[b]-maxBy[a]) || a.localeCompare(b, undefined, {numeric:true}));
+  const maxBy = {};
+  DATA.summary.forEach(s => {
+    if (!(s.family in maxBy)) maxBy[s.family] = null;
+    if (s.score != null) maxBy[s.family] = Math.max(maxBy[s.family] ?? 0, s.score);
+  });
+  const allFams = Object.keys(maxBy).sort((a,b) =>
+    ((maxBy[b] ?? -1) - (maxBy[a] ?? -1)) || a.localeCompare(b, undefined, {numeric:true}));
   function render() {
   const hide = $("#hideZero").checked;
-  const fams = hide ? allFams.filter(f => maxBy[f] > 0) : allFams;
+  const fams = hide ? allFams.filter(f => maxBy[f] == null || maxBy[f] > 0) : allFams;
   $("#heatCount").textContent = `${fams.length} of ${allFams.length} families · sorted by worst score`;
-  let h = `<thead><tr><th>region · % withheld</th>${fams.map(f => `<th class="num">${esc(f)}</th>`).join("")}</tr></thead><tbody>`;
+  let h = `<thead><tr><th>region · pressure</th>${fams.map(f => `<th class="num">${esc(f)}</th>`).join("")}</tr></thead><tbody>`;
   for (const r of regions) {
     const pairOf = DATA.meta.pair_of?.[r];
-    h += `<tr><th class="rowh">${pairOf ? "↳ " : ""}${esc(r)}<span class="rs">${DATA.regionScores[r] != null ? esc(DATA.regionScores[r]) + "% withheld" : "—"}${pairOf ? ` · pair of ${esc(pairOf)}` : ""}</span></th>`;
+    h += `<tr><th class="rowh">${pairOf ? "↳ " : ""}${esc(r)}<span class="rs">${DATA.regionScores[r] != null ? esc(DATA.regionScores[r]) + " pressure" : "n/a"}${pairOf ? ` · pair of ${esc(pairOf)}` : ""}</span></th>`;
     for (const f of fams) {
       const s = idx[r + "|" + f];
       if (!s) { h += `<td class="cell"><span class="c empty">·</span></td>`; continue; }
-      h += `<td class="cell"><span class="c" data-key="${esc(r + "|" + f)}" style="background:${seqVar(s.score)};color:${seqInk(s.score)}">${s.score.toFixed(0)}</span></td>`;
+      if (s.score == null) {
+        h += `<td class="cell"><span class="c na" data-key="${esc(r + "|" + f)}">n/a</span></td>`;
+      } else {
+        h += `<td class="cell"><span class="c" data-key="${esc(r + "|" + f)}" style="background:${seqVar(s.score)};color:${seqInk(s.score)}">${s.score.toFixed(0)}</span></td>`;
+      }
     }
     h += `</tr>`;
   }
@@ -216,15 +230,15 @@ function seqInk(score) {
   }
   $("#hideZero").addEventListener("change", render);
   render();
-  $("#legend").innerHTML = `0% withheld ` + [0,10,25,40,55,70,85,100].map(v => `<span class="sw" style="background:${seqVar(v)}"></span>`).join("") + ` 100% withheld · cell = % of that family's SKUs withheld in that region · row label = SKU-weighted average across all families`;
+  $("#legend").innerHTML = `0 pressure ` + [0,10,25,40,55,70,85,100].map(v => `<span class="sw" style="background:${seqVar(v)}"></span>`).join("") + ` 100 pressure · dashed n/a = no assessable SKUs · row label uses ${esc(DATA.meta.region_weighting ?? "sku")} weighting`;
 
   const tip = $("#tip");
   $("#heat").addEventListener("mousemove", e => {
     const c = e.target.closest(".c[data-key]");
     if (!c) { tip.hidden = true; return; }
     const s = idx[c.dataset.key];
-    tip.innerHTML = `<b>${esc(s.region)} · ${esc(s.family)}</b><br>${s.score}% of SKUs withheld<br>` +
-      `${s.n_skus} SKUs: ${s.n_available} available, ${s.n_zone_restricted} zone-restricted, ` +
+    tip.innerHTML = `<b>${esc(s.region)} · ${esc(s.family)}</b><br>${s.score == null ? "n/a — no assessable SKUs" : s.score + " restriction pressure"}<br>` +
+      `${s.n_skus} SKUs (${s.n_assessable} assessed): ${s.n_available} available, ${s.n_zone_restricted} zone-restricted, ` +
       `${s.n_region_restricted} region-restricted, ${s.n_quota_blocked} quota-blocked<br>` +
       `zone slots blocked ${s.zone_slots_blocked}/${s.zone_slots_total}`;
     tip.hidden = false;
@@ -242,8 +256,8 @@ function seqInk(score) {
   const fmt = v => v == null ? "—" : Number(v).toFixed(1);
   const cell = v => v == null ? `<td class="num">—</td>` :
     `<td class="num" style="background:${seqVar(v)};color:${seqInk(v)}">${fmt(v)}</td>`;
-  let h = `<thead><tr><th>region</th><th>geography</th><th>zones</th><th class="num">% withheld</th>
-           <th>paired region</th><th>pair geography</th><th>pair zones</th><th class="num">pair % withheld</th><th>flags</th></tr></thead><tbody>`;
+  let h = `<thead><tr><th>region</th><th>geography</th><th>zones</th><th class="num">pressure</th>
+           <th>paired region</th><th>pair geography</th><th>pair zones</th><th class="num">pair pressure</th><th>flags</th></tr></thead><tbody>`;
   for (const p of P) {
     const flags = [];
     if (!p.pair) flags.push("no paired region");
@@ -266,7 +280,9 @@ function seqInk(score) {
     f += `<h2 style="font-size:13px;margin:16px 0 6px">${esc(p.region)} vs ${esc(p.pair)} — by family</h2>
           <div class="scroll"><table><thead><tr><th>family</th><th class="num">${esc(p.region)}</th><th class="num">${esc(p.pair)}</th><th class="num">worse side</th></tr></thead><tbody>`;
     for (const r of p.per_family) {
-      const worse = r.pair_missing ? "pair lacks family" : (r.primary ?? 0) === (r.pair ?? 0) ? "even" : ((r.primary ?? 0) > (r.pair ?? 0) ? p.region : p.pair);
+      const worse = r.pair_missing ? "pair lacks family" :
+        (r.primary == null || r.pair == null) ? "n/a" :
+        r.primary === r.pair ? "even" : (r.primary > r.pair ? p.region : p.pair);
       f += `<tr><td>${esc(r.family)}</td>${cell(r.primary)}${r.pair_missing ? `<td class="num warn">not offered</td>` : cell(r.pair)}<td class="num warn">${esc(worse)}</td></tr>`;
     }
     f += `</tbody></table></div>`;

@@ -1,19 +1,19 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "azcap"
-version = "0.1.0"
-description = "Azure region saturation scanner for VM SKUs — % of SKUs withheld per region, family, zone, and paired region"
+version = "0.2.0"
+description = "Azure VM SKU restriction-pressure scanner for regions, families, zones, and paired regions"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "Steve Ross" }]
 keywords = ["azure", "capacity", "vm", "sku", "availability-zones", "region-pairs"]
 classifiers = [
   "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
   "Topic :: System :: Systems Administration",
 ]
@@ -21,6 +21,13 @@ dependencies = [
   "azure-identity>=1.17",
   "azure-mgmt-compute>=30",
   "azure-mgmt-resource-subscriptions>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2",
+  "pytest>=8",
+  "ruff>=0.8",
 ]
 
 [project.urls]
@@ -35,3 +42,14 @@ packages = ["azcap"]
 
 [tool.setuptools.package-data]
 azcap = ["report_template.html"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

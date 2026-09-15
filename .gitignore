@@ -10,3 +10,5 @@ dist/
 fixtures/sample.json
 .DS_Store
 _old/
+.pytest_cache/
+.ruff_cache/
