@@ -13,16 +13,22 @@ import pytest
 from azcap import (
     EXIT_BLOCKED,
     PROBE_API_VERSION,
+    AssessedMachine,
     FamilySummary,
+    MigrateError,
     ProbeResult,
     Profile,
     ProfileVm,
     QuotaRow,
     RegionVerdict,
+    build_profiles,
     classify,
     diff_against,
+    fetch_migrate_assessment,
     identifier_fingerprint,
     load_profile,
+    machine_from_api,
+    migrate_assessment_id,
     nonnegative_int,
     ordered_unique,
     pair_placement_notes,
@@ -33,6 +39,9 @@ from azcap import (
     probe_candidates,
     probe_once,
     probe_request_body,
+    profile_output_path,
+    profile_to_yaml,
+    read_migrate_xlsx,
     region_scores,
     run_probes,
     split_summary,
@@ -41,18 +50,28 @@ from azcap import (
     write_html,
 )
 
-GENERATOR = Path(__file__).resolve().parent.parent / "fixtures" / "make_fixture.py"
+FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
+GENERATOR = FIXTURES / "make_fixture.py"
+
+
+def load_module(path: Path):
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 @pytest.fixture(scope="session")
 def fixture_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """sample.json + wave1.yaml built by fixtures/make_fixture.py (sample.json is gitignored, so build it here)."""
-    spec = importlib.util.spec_from_file_location("make_fixture", GENERATOR)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
     out = tmp_path_factory.mktemp("fixtures")
-    module.build(out / "sample.json")
+    load_module(GENERATOR).build(out / "sample.json")
     return out
+
+
+@pytest.fixture(scope="session")
+def migrate_sample():
+    return load_module(FIXTURES / "migrate_sample.py")
 
 
 def raw_sku(
@@ -776,7 +795,17 @@ def test_parse_profile_accepts_yaml_and_json_and_defaults(tmp_path: Path, fixtur
         ({**VALID_PROFILE, "vms": [{"sku": "Standard_D8s_v5", "count": 1, "optional": 1}]}, "'optional' must be true"),
         (
             {**VALID_PROFILE, "vms": [{"sku": "Standard_D8s_v5", "count": 1}, {"sku": "standard_d8s_v5", "count": 2}]},
-            "more than once",
+            "more than once as required",
+        ),
+        (
+            {
+                **VALID_PROFILE,
+                "vms": [
+                    {"sku": "Standard_D8s_v5", "count": 1, "optional": True},
+                    {"sku": "Standard_D8s_v5", "count": 2, "optional": True},
+                ],
+            },
+            "more than once as optional",
         ),
     ],
 )
@@ -882,7 +911,10 @@ def test_workload_verdict_precedence_covers_every_status() -> None:
         "region restricted for this subscription",
     )
     assert by["Standard_Z"].status == "restricted" and "usable zones: 3" in by["Standard_Z"].reason
-    assert (by["Standard_Q"].status, by["Standard_Q"].reason) == ("quota", "standardEmptyFamily limit 0, need 16 vCPU")
+    assert (by["Standard_Q"].status, by["Standard_Q"].reason) == (
+        "quota",
+        "standardEmptyFamily limit 0, family need 16 vCPU (this SKU 16)",
+    )
     assert by["Standard_QID"].status == "quota" and "QuotaId" in by["Standard_QID"].reason
     assert (by["Standard_C"].status, by["Standard_C"].reason, by["Standard_C"].probe_score) == (
         "capacity",
@@ -933,7 +965,8 @@ def test_workload_quota_sums_needs_per_family_and_optional_never_blocks() -> Non
     shared = Profile("shared", vms=[ProfileVm("Standard_D8s_v5", 15), ProfileVm("Standard_D16s_v5", 5)])
     [rv] = workload_verdicts(shared, ["eastus"], rows, quota, probes)
     assert [v.status for v in rv.vms] == ["quota", "quota"]
-    assert rv.vms[0].reason == "standardDSv5Family limit 200, used 20, need 200 vCPU"
+    assert rv.vms[0].reason == "standardDSv5Family limit 200, used 20, family need 200 vCPU (this SKU 120)"
+    assert rv.vms[1].reason == "standardDSv5Family limit 200, used 20, family need 200 vCPU (this SKU 80)"
 
     # an optional VM is checked on top of the required total and can only block itself
     probes.append(probe("eastus", "None", sku="Standard_D16s_v5", count=10, score=8))
@@ -1138,3 +1171,399 @@ def test_cli_profile_argument_rules(tmp_path: Path, fixture_dir: Path, run_cli) 
     bad.write_text("name: x\nvms: []\n", encoding="utf-8")
     invalid = run_cli("--regions", "eastus2", "--profile", str(bad), out=tmp_path)
     assert invalid.returncode == 2 and "'vms' must be a non-empty list" in invalid.stderr
+
+
+# --------------------------------------------------------------------------- #
+# Profiles from Azure Migrate
+# --------------------------------------------------------------------------- #
+
+
+def fake_get(pages: dict[str, dict], assessment: dict | None = None, *, status_for: dict[str, int] | None = None):
+    calls: list[str] = []
+
+    def get(url: str):
+        calls.append(url)
+        for prefix, status in (status_for or {}).items():
+            if prefix in url:
+                return status, {}, json.dumps({"error": {"code": "X", "message": "denied or missing"}})
+        if url in pages:
+            return 200, {}, json.dumps(pages[url])
+        if assessment is not None and "assessedMachines" not in url:
+            return 200, {}, json.dumps(assessment)
+        return 404, {}, ""
+
+    get.calls = calls  # type: ignore[attr-defined]
+    return get
+
+
+def test_parse_profile_accepts_and_validates_source_and_disks() -> None:
+    data = {
+        **VALID_PROFILE,
+        "source": {
+            "kind": "azure-migrate",
+            "project": "p",
+            "machines_total": 3,
+            "machines_excluded": {"NotSuitable": 1},
+        },
+        "disks": [{"type": "Premium_LRS", "size": "P30", "count": 2}],
+    }
+    profile = parse_profile(data)
+    assert profile.source["kind"] == "azure-migrate" and profile.disks == [
+        {"type": "Premium_LRS", "size": "P30", "count": 2}
+    ]
+    assert parse_profile(VALID_PROFILE).source is None and parse_profile(VALID_PROFILE).disks == []
+    for bad, message in (
+        ({**data, "source": "azure-migrate"}, "'source' must be a mapping"),
+        ({**data, "source": {"project": "p"}}, "'source.kind' is required"),
+        ({**data, "source": {"kind": "x", "tenant": "t"}}, "'source' has unknown key(s): tenant"),
+        ({**data, "source": {"kind": "x", "machines_total": -1}}, "'source.machines_total' must be a non-negative"),
+        ({**data, "source": {"kind": "x", "target_region": 3}}, "'source.target_region' must be a string"),
+        ({**data, "source": {"kind": "x", "machines_excluded": {"a": "b"}}}, "'source.machines_excluded' must map"),
+        ({**data, "disks": {"type": "x"}}, "'disks' must be a list"),
+        ({**data, "disks": [{"type": "Premium_LRS", "size": "P30"}]}, "disks[1] 'count' must be an integer"),
+        (
+            {**data, "disks": [{"type": "Premium_LRS", "size": "P30", "count": 1, "tier": "x"}]},
+            "disks[1] has unknown key(s): tier",
+        ),
+        ({**data, "disks": [{"type": "", "size": "P30", "count": 1}]}, "disks[1] 'type' is required"),
+        ({**data, "notes": "x"}, "unknown key(s): notes"),
+    ):
+        with pytest.raises(ValueError, match=re.escape(message)):
+            parse_profile(bad)
+
+
+def test_fetch_migrate_assessment_follows_paging_and_reports_403_404(migrate_sample) -> None:
+    pages = migrate_sample.build_api_pages(page_size=4)
+    get = fake_get(pages, migrate_sample.build_assessment())
+    assessment, machines = fetch_migrate_assessment(get, migrate_sample.ASSESSMENT_ID)
+    assert assessment["properties"]["azureLocation"] == "EastUS2"
+    assert [m["name"] for m in machines] == [m[0] for m in migrate_sample.MACHINES]
+    assert len(get.calls) == 4 and "$skipToken=page2" in get.calls[-1]  # 1 assessment + 3 pages
+
+    with pytest.raises(MigrateError, match="Access denied \\(403\\)"):
+        fetch_migrate_assessment(fake_get(pages, status_for={"assessments/": 403}), migrate_sample.ASSESSMENT_ID)
+    with pytest.raises(MigrateError, match="Not found \\(404\\).*--assessment"):
+        fetch_migrate_assessment(fake_get({}, None), migrate_sample.ASSESSMENT_ID)
+    with pytest.raises(MigrateError, match="Not found \\(404\\)"):
+        fetch_migrate_assessment(fake_get({}, migrate_sample.build_assessment()), migrate_sample.ASSESSMENT_ID)
+
+    def boom(url: str):
+        raise RuntimeError("CredentialUnavailableError: token missing")
+
+    with pytest.raises(MigrateError, match="authentication failed"):
+        fetch_migrate_assessment(boom, migrate_sample.ASSESSMENT_ID)
+    assert migrate_assessment_id("s", "rg", "p", "g", "a") == (
+        "/subscriptions/s/resourceGroups/rg/providers/Microsoft.Migrate/assessmentProjects/p/groups/g/assessments/a"
+    )
+
+
+def api_machines(migrate_sample) -> list[AssessedMachine]:
+    pages = migrate_sample.build_api_pages(page_size=100)
+    return [machine_from_api(r) for r in next(iter(pages.values()))["value"]]
+
+
+def test_machine_from_api_reduces_properties(migrate_sample) -> None:
+    machines = {m.name: m for m in api_machines(migrate_sample)}
+    assert machines["db-01"] == AssessedMachine(
+        "db-01", "Standard_E16s_v5", "Suitable", "Linux", None, [("Premium", "Premium_P30"), ("Premium", "Premium_P40")]
+    )
+    assert machines["legacy-01"].size is None and machines["legacy-01"].explanation == "Unsupported operating system"
+    assert machines["batch-01"].os is None and machines["web-01"].os == "Windows"
+    assert machine_from_api({"name": "x", "properties": {"suitability": "Weird"}}).suitability == "Unknown"
+    wordy = {"properties": {"disks": {"a": {"recommendedDiskType": "Premium SSD v2", "recommendedDiskSize": " P1 "}}}}
+    assert machine_from_api(wordy).disks == [("PremiumV2", "P1")]
+    assert machine_from_api({"name": "x"}).name == "x"
+
+
+def test_build_profiles_maps_suitability_headroom_os_split_and_disks(migrate_sample) -> None:
+    machines = api_machines(migrate_sample)
+    source = {"kind": "azure-migrate", "assessment": "wave1-assess", "target_region": "eastus2", "exported": "now"}
+    profiles, summary = build_profiles(machines, name="wave1", source=source)
+
+    assert [p.name for p in profiles] == ["wave1-linux", "wave1-windows"]  # majority OS first
+    linux, windows = profiles
+    assert linux.os == "Linux" and windows.os == "Windows" and not linux.zonal
+    # D8s_v5: one Suitable + one ConditionallySuitable sharing a size -> two entries, required then optional
+    assert [(v.sku, v.count, v.optional) for v in linux.vms] == [
+        ("Standard_D8s_v5", 1, False),
+        ("Standard_D8s_v5", 1, True),
+        ("Standard_E16s_v5", 2, False),
+        ("Standard_F8s_v2", 1, False),  # unknown OS -> majority (Linux)
+    ]
+    assert [(v.sku, v.count, v.optional) for v in windows.vms] == [("Standard_D4s_v5", 2, False)]
+    assert linux.disks == [
+        {"type": "Premium", "size": "Premium_P30", "count": 4},
+        {"type": "Premium", "size": "Premium_P40", "count": 2},
+        {"type": "StandardSSD", "size": "StandardSSD_E10", "count": 1},
+    ]
+    assert windows.disks == [{"type": "Premium", "size": "Premium_P10", "count": 2}]
+    assert linux.source == {
+        "kind": "azure-migrate",
+        "assessment": "wave1-assess",
+        "target_region": "eastus2",
+        "exported": "now",
+        "machines_total": 11,
+        "machines_required": 4,
+        "machines_optional": 1,
+        "machines_excluded": {"NoRecommendedSize": 1, "NotSuitable": 2, "Unknown": 1},
+    }
+    assert list(linux.source) == [
+        "kind",
+        "assessment",
+        "target_region",
+        "exported",
+        "machines_total",
+        "machines_required",
+        "machines_optional",
+        "machines_excluded",
+    ]
+    assert summary["by_suitability"] == {"Suitable": 7, "ConditionallySuitable": 1, "NotSuitable": 2, "Unknown": 1}
+    assert summary["explanations"] == {"Unsupported operating system": 2, "Not enough performance data": 1}
+    assert (summary["mixed_os"], summary["unknown_os"], summary["majority_os"]) == (True, 1, "Linux")
+    assert "merged_skus" not in summary
+
+    # --conditional required / skip: one entry either way
+    required, _ = build_profiles(machines, name="w", conditional="required")
+    assert [(v.count, v.optional) for v in required[0].vms if v.sku == "Standard_D8s_v5"] == [(2, False)]
+    skipped, summary = build_profiles(machines, name="w", conditional="skip")
+    assert [(v.count, v.optional) for v in skipped[0].vms if v.sku == "Standard_D8s_v5"] == [(1, False)]
+    assert summary["excluded"]["ConditionallySuitable (skipped)"] == 1
+
+    # a conditionally suitable machine on its own size stays optional
+    solo = [AssessedMachine("c", "Standard_D2s_v5", "ConditionallySuitable", "Linux")]
+    assert build_profiles(solo, name="w")[0][0].vms == [ProfileVm("Standard_D2s_v5", 1, True)]
+
+    # headroom: ceil(count * pct / 100) on required counts only; single OS -> one profile, unsuffixed
+    single = [AssessedMachine(f"m{i}", "Standard_D8s_v5", "Suitable", "Windows") for i in range(7)] + solo
+    single[-1].os = "Windows"
+    [only], summary = build_profiles(single, name="one", headroom=10)
+    assert only.name == "one" and only.os == "Windows" and summary["mixed_os"] is False
+    assert [(v.sku, v.count, v.optional) for v in only.vms] == [
+        ("Standard_D2s_v5", 1, True),
+        ("Standard_D8s_v5", 8, False),
+    ]
+    [big], _ = build_profiles(single[:7], name="one", headroom=15)
+    assert big.vms[0].count == 7 + 2  # ceil(1.05) = 2
+
+    # nothing usable
+    empty, summary = build_profiles([AssessedMachine("x", None, "NotSuitable", None)], name="e")
+    assert empty == [] and summary["excluded"] == {"NotSuitable": 1}
+
+
+def test_profile_yaml_round_trips_and_output_paths(tmp_path: Path, migrate_sample, fixture_dir: Path, run_cli) -> None:
+    profiles, _ = build_profiles(api_machines(migrate_sample), name="wave1", source={"kind": "azure-migrate"})
+    for profile in profiles:
+        out = profile_output_path(str(tmp_path / "wave1.yaml"), profile, mixed=True)
+        out.write_text(profile_to_yaml(profile), encoding="utf-8")
+        assert out.name == f"wave1-{profile.os.lower()}.yaml"
+        assert load_profile(out) == profile
+    assert profile_output_path(None, profiles[0], mixed=True) == Path("wave1-linux.yaml")
+    assert profile_output_path("x/y.yml", profiles[0], mixed=False) == Path("x/y.yml")
+    text = (tmp_path / "wave1-linux.yaml").read_text(encoding="utf-8")
+    assert text.startswith("# azcap workload profile") and text.count("optional: true") == 1
+
+    # the generated profile drives verdicts through the normal CLI
+    result = run_cli(
+        "--regions", "eastus2", "--no-pairs", "--profile", str(tmp_path / "wave1-linux.yaml"), out=tmp_path / "out"
+    )
+    assert result.returncode == 0, result.stderr
+    rows = list(csv.DictReader((tmp_path / "out" / "verdicts.csv").open(encoding="utf-8", newline="")))
+    assert {r["sku"] for r in rows} == {"Standard_D8s_v5", "Standard_E16s_v5", "Standard_F8s_v2"}
+    raw = json.loads((tmp_path / "out" / "raw.json").read_text(encoding="utf-8"))
+    assert raw["profile"]["source"]["kind"] == "azure-migrate" and raw["profile"]["disks"]
+
+
+def test_read_migrate_xlsx_detects_headers_and_lists_them_when_missing(tmp_path: Path, migrate_sample) -> None:
+    pytest.importorskip("openpyxl")
+    export = tmp_path / "export.xlsx"
+    migrate_sample.build_xlsx(export)
+    machines, info = read_migrate_xlsx(export)
+    by = {m.name: m for m in machines}
+    assert info["machines_sheet"] == "All_Assessed_Machines" and info["disks_sheet"] == "All_Assessed_Disks"
+    assert (info["target_region"], info["sizing_criterion"], info["comfort_factor"]) == (
+        "eastus2",
+        "PerformanceBased",
+        "1.3",
+    )
+    assert info["sizing_criterion"] == migrate_sample.build_assessment()["properties"]["sizingCriterion"]
+    assert (info["subscription"], info["project"], info["group"], info["assessment"]) == (
+        "00000000-0000-0000-0000-000000000000",
+        "contoso-proj",
+        "wave1",
+        "wave1-assess",
+    )
+    assert by["app-02"].suitability == "ConditionallySuitable" and by["legacy-01"].suitability == "NotSuitable"
+    assert by["unk-01"].suitability == "Unknown" and by["legacy-01"].size is None
+    assert (by["web-01"].os, by["app-01"].os, by["batch-01"].os) == ("Windows", "Linux", None)
+    assert by["db-01"].disks == [("Premium", "Premium_P30"), ("Premium", "Premium_P40")]
+    assert by["batch-01"].disks == [("StandardSSD", "StandardSSD_E10")] and info["unattached_disks"] == []
+    api_shape = {m.name: (m.size, m.suitability, m.os, m.disks) for m in api_machines(migrate_sample)}
+    assert {m.name: (m.size, m.suitability, m.os, m.disks) for m in machines} == api_shape
+
+    # other header spellings and a disks sheet without a machine column
+    varied = tmp_path / "varied.xlsx"
+    migrate_sample.build_xlsx(
+        varied,
+        machine_headers=["Server name", "Readiness", "Azure VM size", "OPERATING SYSTEM", "Cores", "Memory"],
+        disk_headers=["Host", "Disk", "Recommended disk type", "Disk size (recommended)", "GB"],
+    )
+    machines, info = read_migrate_xlsx(varied)
+    assert {m.name: m.size for m in machines}["db-01"] == "Standard_E16s_v5"
+    assert all(m.disks == [] for m in machines) and len(info["unattached_disks"]) == 9
+    assert info["unattached_disks"][0] == ("Premium", "Premium_P10")
+
+    missing = tmp_path / "missing.xlsx"
+    migrate_sample.build_xlsx(
+        missing, machine_headers=["Name", "Ready?", "Size", "OS", "Cores", "Mem"], with_disks=False
+    )
+    with pytest.raises(MigrateError, match=re.escape("no column for readiness, recommended size, machine name")) as e:
+        read_migrate_xlsx(missing)
+    assert "Headers found: Name, Ready?, Size, OS, Cores, Mem" in str(e.value)
+
+    nosheet = tmp_path / "nosheet.xlsx"
+    import openpyxl
+
+    openpyxl.Workbook().save(nosheet)
+    with pytest.raises(MigrateError, match="no sheet named like 'Assessed_Machines' \\(sheets: Sheet\\)"):
+        read_migrate_xlsx(nosheet)
+
+
+def test_cli_profile_from_migrate_xlsx_writes_profiles(tmp_path: Path, migrate_sample) -> None:
+    pytest.importorskip("openpyxl")
+    export = tmp_path / "wave1-export.xlsx"
+    migrate_sample.build_xlsx(export)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "azcap",
+            "profile",
+            "from-migrate-xlsx",
+            str(export),
+            "--headroom",
+            "10",
+            "--name",
+            "wave1",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Machines: 11 assessed" in result.stdout and "one profile per OS" in result.stdout
+    assert "Target region in the assessment: eastus2" in result.stdout
+    assert "azcap --regions eastus2 --profile wave1-linux.yaml --fail-on-blocked" in result.stdout
+    linux = load_profile(tmp_path / "wave1-linux.yaml")
+    assert [(v.sku, v.count, v.optional) for v in linux.vms] == [
+        ("Standard_D8s_v5", 2, False),  # 1 + ceil(10%)
+        ("Standard_D8s_v5", 1, True),
+        ("Standard_E16s_v5", 3, False),
+        ("Standard_F8s_v2", 2, False),
+    ]
+    assert load_profile(tmp_path / "wave1-windows.yaml").vms == [ProfileVm("Standard_D4s_v5", 3)]
+    assert linux.source["assessment"] == "wave1-assess" and linux.source["target_region"] == "eastus2"
+    assert linux.source["subscription"] == "00000000-0000-0000-0000-000000000000" and "exported" in linux.source
+
+    usage = subprocess.run([sys.executable, "-m", "azcap", "profile", "from-migrate"], capture_output=True, text=True)
+    assert usage.returncode == 2 and "--assessment-id or all of --project" in usage.stderr
+    bad_id = subprocess.run(
+        [sys.executable, "-m", "azcap", "profile", "from-migrate", "--assessment-id", "/subscriptions/x/foo"],
+        capture_output=True,
+        text=True,
+    )
+    assert bad_id.returncode == 2 and "--assessment-id must be" in bad_id.stderr
+
+
+def test_same_sku_required_and_optional_is_allowed_and_judged_per_entry() -> None:
+    profile = parse_profile(
+        {
+            "name": "dup",
+            "vms": [
+                {"sku": "Standard_D8s_v5", "count": 10},
+                {"sku": "Standard_D8s_v5", "count": 10, "optional": True},
+                {"sku": "Standard_D2s_v5", "count": 3, "optional": True},
+            ],
+        }
+    )
+    assert [(v.count, v.optional) for v in profile.vms][:2] == [(10, False), (10, True)]
+
+    rows = [scan_row("Standard_D8s_v5"), scan_row("Standard_D2s_v5")]  # both 8 vCPU here, standardDSv5Family
+    quota = [QuotaRow("eastus", "standardDSv5Family", "DSv5", 0, 110)]  # 110 free
+    probes = [
+        probe("eastus", "None", sku="Standard_D8s_v5", count=10, score=8),
+        probe("eastus", "InsufficientCapacity", sku="Standard_D2s_v5", count=3, score=2, split=[]),
+    ]
+    [rv] = workload_verdicts(profile, ["eastus"], rows, quota, probes)
+    # required 80 vCPU fits; optional x10 needs 80 on top of the required 80 -> quota; D2s x3 (24 on top) fits
+    assert [(v.sku, v.count, v.optional, v.status) for v in rv.vms] == [
+        ("Standard_D8s_v5", 10, False, "deployable"),
+        ("Standard_D8s_v5", 10, True, "quota"),
+        ("Standard_D2s_v5", 3, True, "capacity"),
+    ]
+    assert rv.verdict == "deployable" and rv.blocking == []
+    assert rv.vms[1].reason == "standardDSv5Family limit 110, family need 160 vCPU (this SKU 80)"
+    # the required and optional x10 entries share one probe request
+    assert probe_candidates(profile, ["eastus"], rows, quota) == {
+        "eastus": [("Standard_D8s_v5", 10), ("Standard_D2s_v5", 3)]
+    }
+
+    # two required (or two optional) entries of the same SKU are still duplicates
+    with pytest.raises(ValueError, match="more than once as required"):
+        parse_profile(
+            {"name": "d", "vms": [{"sku": "Standard_D8s_v5", "count": 1}, {"sku": "standard_d8s_v5", "count": 2}]}
+        )
+
+
+def test_readiness_and_disk_type_wording_from_real_exports() -> None:
+    from azcap import _suitability_from_readiness, normalize_disk_type
+
+    assert _suitability_from_readiness("Ready") == "Suitable"
+    assert _suitability_from_readiness("Ready for Azure") == "Suitable"
+    assert _suitability_from_readiness("Ready With Conditions") == "ConditionallySuitable"
+    assert _suitability_from_readiness("  ready   with\nconditions ") == "ConditionallySuitable"
+    assert _suitability_from_readiness("Conditionally ready for Azure") == "ConditionallySuitable"
+    assert _suitability_from_readiness("Not Ready") == "NotSuitable"
+    assert _suitability_from_readiness("Not ready for Azure") == "NotSuitable"
+    assert _suitability_from_readiness("Unknown") == "Unknown"
+    assert _suitability_from_readiness("") == "Unknown"
+    assert _suitability_from_readiness(None) == "Unknown"
+
+    assert normalize_disk_type("Premium managed disks") == "Premium"
+    assert normalize_disk_type("Standard SSD managed disks") == "StandardSSD"
+    assert normalize_disk_type("Standard HDD managed disks") == "Standard"
+    assert normalize_disk_type("Ultra disks") == "Ultra"
+    assert normalize_disk_type("Premium SSD v2 managed disks") == "PremiumV2"
+    for enum in ("Premium", "StandardSSD", "Standard", "Ultra", "PremiumV2"):
+        assert normalize_disk_type(enum) == enum
+    assert normalize_disk_type(" Mystery ") == "Mystery"
+
+    from azcap import normalize_sizing_criterion
+
+    for wording in ("Performance-based", "performance based", "PerformanceBased", "Performance"):
+        assert normalize_sizing_criterion(wording) == "PerformanceBased"
+    for wording in ("As on-premises", "as-is", "As is", "AsOnPremises", "As On-Prem"):
+        assert normalize_sizing_criterion(wording) == "AsOnPremises"
+    assert normalize_sizing_criterion("Custom") == "Custom" and normalize_sizing_criterion("") is None
+
+
+def test_read_migrate_xlsx_without_summary_or_properties_sheets(tmp_path: Path, migrate_sample) -> None:
+    import openpyxl
+
+    export = tmp_path / "bare.xlsx"
+    migrate_sample.build_xlsx(export)
+    book = openpyxl.load_workbook(export)
+    for title in ("Assessment_Summary", "Assessment_Properties"):
+        del book[title]
+    book.save(export)
+    machines, info = read_migrate_xlsx(export)
+    assert len(machines) == 11
+    assert info["target_region"] is None and info["assessment"] is None and info["subscription"] is None
+    result = subprocess.run(
+        [sys.executable, "-m", "azcap", "profile", "from-migrate-xlsx", str(export), "--out-profile", "p.yaml"],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "azcap --regions <region> --profile p-linux.yaml --fail-on-blocked" in result.stdout
+    assert load_profile(tmp_path / "p-linux.yaml").source["assessment"] == "bare.xlsx"

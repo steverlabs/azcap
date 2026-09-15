@@ -69,12 +69,14 @@ import datetime as dt
 import fnmatch
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
 import time
+import warnings
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from importlib.metadata import PackageNotFoundError, version
@@ -162,6 +164,9 @@ class Profile:
     os: str = "Linux"
     zonal: bool = False
     vms: list[ProfileVm] = field(default_factory=list)
+    # Provenance and disk needs, e.g. from an Azure Migrate assessment. Recorded and shown; not judged yet.
+    source: dict | None = None
+    disks: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -184,7 +189,7 @@ class VmVerdict:
 class RegionVerdict:
     region: str
     verdict: str  # deployable | blocked | unknown
-    blocking: list[str]  # "quota: Standard_D8s_v5 (standardDSv5Family limit 0, need 96 vCPU)" per required VM
+    blocking: list[str]  # "quota: Standard_D8s_v5 (standardDSv5Family limit 0, family need 96 vCPU (this SKU 96))"
     vms: list[VmVerdict]
 
 
@@ -514,6 +519,22 @@ def arm_poster(credential):
     return post
 
 
+def arm_getter(credential):
+    """A `get(url) -> (status, headers, text)` for ARM, same token handling as arm_poster."""
+    import requests
+
+    session = requests.Session()
+    state: dict[str, Any] = {}
+
+    def get(url: str) -> tuple[int, Any, str]:
+        if "token" not in state:
+            state["token"] = credential.get_token(ARM_SCOPE).token
+        r = session.get(url, headers={"Authorization": f"Bearer {state['token']}"}, timeout=60)
+        return r.status_code, r.headers, r.text
+
+    return get
+
+
 def quota_precheck(raw: list[dict], quota: list[QuotaRow], region: str, group: list[tuple[str, int]]) -> str | None:
     """Reason the request cannot fit in the family's vCPU quota, or None when it fits or can't be judged.
 
@@ -657,8 +678,73 @@ def pair_placement_notes(pairs: list[dict], probes: list[ProbeResult]) -> None:
 # Workload profiles and verdicts
 # --------------------------------------------------------------------------- #
 
-PROFILE_KEYS = {"name", "os", "zonal", "vms"}
+PROFILE_KEYS = {"name", "os", "zonal", "vms", "source", "disks"}
 PROFILE_VM_KEYS = {"sku", "count", "optional"}
+PROFILE_SOURCE_STR_KEYS = (
+    "kind",
+    "subscription",
+    "project",
+    "group",
+    "assessment",
+    "target_region",
+    "sizing_criterion",
+    "comfort_factor",
+    "exported",
+)
+PROFILE_SOURCE_INT_KEYS = ("machines_total", "machines_required", "machines_optional")
+PROFILE_SOURCE_KEYS = {*PROFILE_SOURCE_STR_KEYS, *PROFILE_SOURCE_INT_KEYS, "machines_excluded"}
+PROFILE_DISK_KEYS = {"type", "size", "count"}
+
+
+def _parse_profile_source(source: Any) -> dict | None:
+    if source is None:
+        return None
+    if not isinstance(source, dict):
+        raise ValueError("profile 'source' must be a mapping")
+    unknown = sorted(set(source) - PROFILE_SOURCE_KEYS)
+    if unknown:
+        raise ValueError(f"profile 'source' has unknown key(s): {', '.join(unknown)}")
+    if not isinstance(source.get("kind"), str) or not source["kind"].strip():
+        raise ValueError("profile 'source.kind' is required and must be a string (e.g. azure-migrate)")
+    for key in PROFILE_SOURCE_STR_KEYS:
+        if source.get(key) is not None and not isinstance(source[key], str):
+            raise ValueError(f"profile 'source.{key}' must be a string")
+    for key in PROFILE_SOURCE_INT_KEYS:
+        value = source.get(key)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            raise ValueError(f"profile 'source.{key}' must be a non-negative integer")
+    excluded = source.get("machines_excluded")
+    if excluded is not None:
+        if not isinstance(excluded, dict) or any(
+            not isinstance(k, str) or isinstance(v, bool) or not isinstance(v, int) or v < 0
+            for k, v in excluded.items()
+        ):
+            raise ValueError("profile 'source.machines_excluded' must map reason names to non-negative counts")
+    return dict(source)
+
+
+def _parse_profile_disks(disks: Any) -> list[dict]:
+    if disks is None:
+        return []
+    if not isinstance(disks, list):
+        raise ValueError("profile 'disks' must be a list of {type, size, count}")
+    parsed: list[dict] = []
+    for i, d in enumerate(disks, 1):
+        if not isinstance(d, dict):
+            raise ValueError(f"profile disks[{i}] must be a mapping with type, size, count")
+        unknown = sorted(set(d) - PROFILE_DISK_KEYS)
+        if unknown:
+            raise ValueError(
+                f"profile disks[{i}] has unknown key(s): {', '.join(unknown)} (allowed: type, size, count)"
+            )
+        for key in ("type", "size"):
+            if not isinstance(d.get(key), str) or not d[key].strip():
+                raise ValueError(f"profile disks[{i}] '{key}' is required and must be a non-empty string")
+        count = d.get("count")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise ValueError(f"profile disks[{i}] 'count' must be an integer of 1 or more, got {count!r}")
+        parsed.append({"type": d["type"].strip(), "size": d["size"].strip(), "count": count})
+    return parsed
 
 
 def parse_profile(data: Any) -> Profile:
@@ -667,7 +753,9 @@ def parse_profile(data: Any) -> Profile:
         raise ValueError("profile must be a mapping with name, vms and optionally os, zonal")
     unknown = sorted(set(data) - PROFILE_KEYS)
     if unknown:
-        raise ValueError(f"profile has unknown key(s): {', '.join(unknown)} (allowed: name, os, zonal, vms)")
+        raise ValueError(
+            f"profile has unknown key(s): {', '.join(unknown)} (allowed: name, os, zonal, vms, source, disks)"
+        )
     name = data.get("name")
     if not isinstance(name, str) or not name.strip():
         raise ValueError("profile 'name' is required and must be a non-empty string")
@@ -699,10 +787,21 @@ def parse_profile(data: Any) -> Profile:
         if not isinstance(optional, bool):
             raise ValueError(f"profile vms[{i}] ({sku}) 'optional' must be true or false, got {optional!r}")
         sku = sku.strip()
-        if any(sku.lower() == existing.sku.lower() for existing in parsed):
-            raise ValueError(f"profile lists {sku} more than once")
+        # a SKU may appear twice, as one required and one optional entry; never twice with the same flag
+        if any(sku.lower() == existing.sku.lower() and optional == existing.optional for existing in parsed):
+            raise ValueError(
+                f"profile lists {sku} more than once as {'optional' if optional else 'required'}; "
+                "a SKU may appear at most twice, once required and once optional"
+            )
         parsed.append(ProfileVm(sku=sku, count=count, optional=optional))
-    return Profile(name=name.strip(), os=os_type, zonal=zonal, vms=parsed)
+    return Profile(
+        name=name.strip(),
+        os=os_type,
+        zonal=zonal,
+        vms=parsed,
+        source=_parse_profile_source(data.get("source")),
+        disks=_parse_profile_disks(data.get("disks")),
+    )
 
 
 def load_profile(path: Path) -> Profile:
@@ -734,9 +833,11 @@ def load_profile(path: Path) -> Profile:
         raise ValueError(f"Invalid profile {path}: {e}") from e
 
 
-def _quota_reason(q: QuotaRow, need: int) -> str:
+def _quota_reason(q: QuotaRow, need: int, own: int) -> str:
+    """`need` is the family total the check used (every required VM in the profile, plus this entry when it is
+    optional); `own` is this entry's vcpus x count, so a reader can see how much of the family need is its own."""
     used = f", used {q.current}" if q.current else ""
-    return f"{q.family} limit {q.limit}{used}, need {need} vCPU"
+    return f"{q.family} limit {q.limit}{used}, family need {need} vCPU (this SKU {own})"
 
 
 def workload_verdicts(
@@ -783,7 +884,7 @@ def workload_verdicts(
                 v.status = "restricted"
                 v.reason = f"usable zones: {usable}; zone-resilient placement needs 2 or more"
             elif q is not None and v.vcpu_need is not None and (q.limit == 0 or q.limit - q.current < need):
-                v.status, v.reason = "quota", _quota_reason(q, need)
+                v.status, v.reason = "quota", _quota_reason(q, need, v.vcpu_need)
             elif row.status == "quota_blocked":
                 v.status, v.reason = "quota", "QuotaId restriction for this subscription (offer or quota eligibility)"
             elif probe is None or probe.error:
@@ -819,7 +920,10 @@ def probe_candidates(
     """Profile VMs per region that pass steps 1-3 (offered, not restricted, within quota) and so need a
     placement probe; the rest are already decided and are not worth a call."""
     undecided = workload_verdicts(profile, regions, rows, quota, [])
-    return {rv.region: [(v.sku, v.count) for v in rv.vms if v.status == "unknown"] for rv in undecided}
+    # a SKU listed as both required and optional with the same count needs one probe, not two
+    return {
+        rv.region: list(dict.fromkeys((v.sku, v.count) for v in rv.vms if v.status == "unknown")) for rv in undecided
+    }
 
 
 def _dr_reasons(rv: RegionVerdict) -> str:
@@ -855,6 +959,436 @@ def pair_verdict_notes(pairs: list[dict], verdicts: list[RegionVerdict]) -> None
                 blocked = [f"{r.region} blocked: {_dr_reasons(r)}" for r in (a, b) if r.verdict == "blocked"]
                 note = "; ".join(blocked + [f"{u} not determined (placement probe unavailable)" for u in unknown])
         row["dr_note"] = note
+
+
+# --------------------------------------------------------------------------- #
+# Profiles from Azure Migrate assessments
+# --------------------------------------------------------------------------- #
+
+MIGRATE_API_VERSION = "2023-03-15"
+MIGRATE_SUITABILITIES = ("Suitable", "ConditionallySuitable", "NotSuitable", "Unknown")
+
+
+@dataclass
+class AssessedMachine:
+    """One machine from an assessment, reduced to what a profile needs."""
+
+    name: str
+    size: str | None  # recommended Azure VM size; None when Migrate gave none
+    suitability: str  # Suitable | ConditionallySuitable | NotSuitable | Unknown
+    os: str | None  # Linux | Windows | None (unknown)
+    explanation: str | None = None  # suitabilityExplanation, tallied for excluded machines
+    disks: list[tuple[str, str]] = field(default_factory=list)  # (recommended disk type, size), e.g. (Premium_LRS, P30)
+
+
+class MigrateError(ValueError):
+    """A concise, user-facing problem reading an assessment (auth, 403/404, bad shape)."""
+
+
+def migrate_assessment_id(subscription: str, resource_group: str, project: str, group: str, assessment: str) -> str:
+    return (
+        f"/subscriptions/{subscription}/resourceGroups/{resource_group}/providers/Microsoft.Migrate"
+        f"/assessmentProjects/{project}/groups/{group}/assessments/{assessment}"
+    )
+
+
+def _migrate_get_json(get, url: str, what: str) -> dict:
+    try:
+        status, _headers, text = get(url)
+    except Exception as e:
+        if "Credential" in type(e).__name__ or "token" in str(e).lower():
+            raise MigrateError(
+                "Azure authentication failed (token missing or expired). Run:\n"
+                "  az login --scope https://management.azure.com/.default\nthen rerun."
+            ) from e
+        raise MigrateError(f"Azure request failed while reading {what} ({type(e).__name__}): {e}") from e
+    try:
+        payload = json.loads(text) if text else None
+    except ValueError:
+        payload = None
+    if status in (401, 403):
+        raise MigrateError(
+            f"Access denied ({status}) reading {what}: the signed-in identity needs Reader on the Azure Migrate "
+            "project (check --subscription / --tenant and `az account show`)."
+        )
+    if status == 404:
+        raise MigrateError(
+            f"Not found (404): {what}. Check --resource-group, --project, --group and --assessment "
+            "(names, not display names) and that --subscription is the one holding the Migrate project."
+        )
+    if status != 200:
+        raise MigrateError(f"Azure request failed reading {what}: {_short_error(status, payload, text)}")
+    if not isinstance(payload, dict):
+        raise MigrateError(f"Unexpected response reading {what}: body is not a JSON object")
+    return payload
+
+
+def fetch_migrate_assessment(get, assessment_id: str) -> tuple[dict, list[dict]]:
+    """GET the assessment and every page of its assessedMachines. Returns (assessment, machine resources)."""
+    base = f"{ARM_ENDPOINT}{assessment_id}"
+    assessment = _migrate_get_json(get, f"{base}?api-version={MIGRATE_API_VERSION}", "the assessment")
+    machines: list[dict] = []
+    url: str | None = f"{base}/assessedMachines?api-version={MIGRATE_API_VERSION}"
+    seen: set[str] = set()
+    while url and url not in seen:
+        seen.add(url)
+        page = _migrate_get_json(get, url, "assessed machines")
+        values = page.get("value")
+        if not isinstance(values, list):
+            raise MigrateError("Unexpected response reading assessed machines: no 'value' list")
+        machines.extend(v for v in values if isinstance(v, dict))
+        url = page.get("nextLink") or None
+    return assessment, machines
+
+
+def _os_from_guest(value: Any) -> str | None:
+    text = str(value or "").lower()
+    if "windows" in text:
+        return "Windows"
+    if "linux" in text:
+        return "Linux"
+    return None
+
+
+def machine_from_api(resource: dict) -> AssessedMachine:
+    """Reduce an assessedMachines item (properties.*) to an AssessedMachine."""
+    props = resource.get("properties") if isinstance(resource.get("properties"), dict) else {}
+    disks: list[tuple[str, str]] = []
+    for d in (props.get("disks") or {}).values() if isinstance(props.get("disks"), dict) else []:
+        if isinstance(d, dict) and d.get("recommendedDiskType") and d.get("recommendedDiskSize"):
+            disks.append((normalize_disk_type(d["recommendedDiskType"]), str(d["recommendedDiskSize"]).strip()))
+    suitability = str(props.get("suitability") or "Unknown")
+    return AssessedMachine(
+        name=str(props.get("displayName") or resource.get("name") or "?"),
+        size=str(props["recommendedSize"]).strip() or None if props.get("recommendedSize") else None,
+        suitability=suitability if suitability in MIGRATE_SUITABILITIES else "Unknown",
+        os=_os_from_guest(props.get("operatingSystemType")),
+        explanation=str(props["suitabilityExplanation"]) if props.get("suitabilityExplanation") else None,
+        disks=disks,
+    )
+
+
+def _os_from_name(value: Any) -> str | None:
+    """'Windows Server 2019 Datacenter' -> Windows; 'Ubuntu 22.04' -> Linux; else None."""
+    text = str(value or "").lower()
+    if "windows" in text:
+        return "Windows"
+    if any(
+        k in text for k in ("linux", "ubuntu", "centos", "red hat", "rhel", "suse", "sles", "debian", "rocky", "alma")
+    ):
+        return "Linux"
+    return None
+
+
+def _norm(value: Any) -> str:
+    """Lower-case with whitespace collapsed, for matching export wording."""
+    return " ".join(str(value or "").split()).lower()
+
+
+def _suitability_from_readiness(value: Any) -> str:
+    """Excel 'Azure VM readiness' wording -> API suitability value ('Ready With Conditions' is conditional)."""
+    text = _norm(value)
+    if "ready with conditions" in text or "conditionally ready" in text or "conditionally suitable" in text:
+        return "ConditionallySuitable"
+    if "not ready" in text or "not suitable" in text:
+        return "NotSuitable"
+    if "ready" in text or "suitable" in text:
+        return "Suitable"
+    return "Unknown"
+
+
+DISK_TYPE_NAMES = (  # export wording -> API recommendedDiskType enum; order matters (premium v2 before premium)
+    ("premium ssd v2", "PremiumV2"),
+    ("premiumv2", "PremiumV2"),
+    ("standard ssd", "StandardSSD"),
+    ("standardssd", "StandardSSD"),
+    ("standard hdd", "Standard"),
+    ("ultra", "Ultra"),
+    ("premium", "Premium"),
+    ("standard", "Standard"),
+)
+
+
+def normalize_sizing_criterion(value: Any) -> str | None:
+    """'Performance-based' -> PerformanceBased; 'As on-premises' / 'As-is' -> AsOnPremises; API enums pass through."""
+    text = _norm(value).replace("-", " ")
+    if not text:
+        return None
+    if "performance" in text:
+        return "PerformanceBased"
+    if "on prem" in text or "onprem" in text or text in ("as is", "asis"):
+        return "AsOnPremises"
+    return str(value).strip()
+
+
+def normalize_disk_type(value: Any) -> str:
+    """'Premium managed disks' / 'Standard SSD managed disks' / API 'Premium' -> Premium / StandardSSD / ..."""
+    text = _norm(value)
+    for needle, enum in DISK_TYPE_NAMES:
+        if needle in text:
+            return enum
+    return str(value or "").strip()
+
+
+def build_profiles(
+    machines: list[AssessedMachine],
+    *,
+    name: str,
+    conditional: str = "optional",
+    headroom: int = 0,
+    source: dict | None = None,
+) -> tuple[list[Profile], dict]:
+    """Turn assessed machines into one profile (or one per OS when mixed) plus a summary for the console.
+
+    Suitable -> required; ConditionallySuitable -> --conditional (optional | required | skip);
+    NotSuitable / Unknown / no recommended size -> excluded and tallied. Headroom inflates required
+    counts by ceil(count * pct / 100)."""
+    included: list[tuple[AssessedMachine, bool]] = []  # (machine, optional)
+    excluded: dict[str, int] = defaultdict(int)
+    explanations: dict[str, int] = defaultdict(int)
+    by_suitability: dict[str, int] = defaultdict(int)
+    for m in machines:
+        by_suitability[m.suitability] += 1
+        if m.suitability == "Suitable":
+            optional = False
+        elif m.suitability == "ConditionallySuitable" and conditional != "skip":
+            optional = conditional == "optional"
+        else:
+            reason = "ConditionallySuitable (skipped)" if m.suitability == "ConditionallySuitable" else m.suitability
+            excluded[reason] += 1
+            if m.explanation:
+                explanations[m.explanation] += 1
+            continue
+        if not m.size:
+            excluded["NoRecommendedSize"] += 1
+            continue
+        included.append((m, optional))
+
+    os_counts: dict[str, int] = defaultdict(int)
+    for m, _ in included:
+        if m.os:
+            os_counts[m.os] += 1
+    known_os = sorted(os_counts, key=lambda o: (-os_counts[o], o))
+    majority = known_os[0] if known_os else "Linux"
+    unknown_os = sum(1 for m, _ in included if not m.os)
+    mixed = len(known_os) > 1
+
+    profiles: list[Profile] = []
+    for os_type in known_os or ["Linux"]:
+        group = [(m, opt) for m, opt in included if (m.os or majority) == os_type]
+        if not group:
+            continue
+        counts: dict[str, dict[str, int]] = defaultdict(lambda: {"required": 0, "optional": 0})
+        disk_counts: dict[tuple[str, str], int] = defaultdict(int)
+        for m, opt in group:
+            counts[m.size]["optional" if opt else "required"] += 1
+            for disk in m.disks:
+                disk_counts[disk] += 1
+        vms: list[ProfileVm] = []
+        for sku in sorted(counts):
+            # a size with both suitable and conditionally suitable machines becomes two entries
+            c = counts[sku]
+            if c["required"]:
+                vms.append(ProfileVm(sku=sku, count=c["required"] + math.ceil(c["required"] * headroom / 100)))
+            if c["optional"]:
+                vms.append(ProfileVm(sku=sku, count=c["optional"], optional=True))
+        disks = [{"type": t, "size": z, "count": n} for (t, z), n in sorted(disk_counts.items())]
+        src = None
+        if source is not None:
+            src = {k: source[k] for k in PROFILE_SOURCE_STR_KEYS if source.get(k) is not None}
+            src.update(
+                machines_total=len(machines),
+                machines_required=sum(1 for _, opt in group if not opt),
+                machines_optional=sum(1 for _, opt in group if opt),
+                machines_excluded=dict(sorted(excluded.items())),
+            )
+        profiles.append(
+            Profile(
+                name=f"{name}-{os_type.lower()}" if mixed else name,
+                os=os_type,
+                zonal=False,
+                vms=vms,
+                source=src,
+                disks=disks,
+            )
+        )
+    summary = {
+        "by_suitability": dict(by_suitability),
+        "excluded": dict(excluded),
+        "explanations": dict(explanations),
+        "included": len(included),
+        "unknown_os": unknown_os,
+        "majority_os": majority,
+        "mixed_os": mixed,
+        "headroom": headroom,
+    }
+    return profiles, summary
+
+
+def profile_to_yaml(profile: Profile) -> str:
+    """Profile as YAML, keys in schema order, without empty optional blocks."""
+    import yaml
+
+    data: dict[str, Any] = {
+        "name": profile.name,
+        "os": profile.os,
+        "zonal": profile.zonal,
+        "vms": [
+            {"sku": vm.sku, "count": vm.count, **({"optional": True} if vm.optional else {})} for vm in profile.vms
+        ],
+    }
+    if profile.disks:
+        data["disks"] = list(profile.disks)
+    if profile.source:
+        data["source"] = dict(profile.source)
+    header = (
+        "# azcap workload profile. zonal is false because Azure Migrate does not assess zone resilience;\n"
+        "# set it to true if the design must span availability zones.\n"
+    )
+    return header + yaml.safe_dump(data, sort_keys=False, allow_unicode=True, width=100)
+
+
+def _cell(row: list[Any], col: int | None) -> Any:
+    return row[col] if col is not None and col < len(row) else None
+
+
+def _find_header(headers: list[str], *needles: str) -> int | None:
+    """Index of the first header containing any needle (case-insensitive)."""
+    for i, h in enumerate(headers):
+        low = h.lower()
+        if any(n in low for n in needles):
+            return i
+    return None
+
+
+def read_migrate_xlsx(path: Path) -> tuple[list[AssessedMachine], dict]:
+    """Read an Azure Migrate assessment export (.xlsx): the Assessed_Machines sheet, plus Assessed_Disks when present.
+    Column detection is by header text and heuristic; a missing required column lists the headers found."""
+    try:
+        import openpyxl
+    except ImportError as e:
+        raise MigrateError("Reading an .xlsx export needs openpyxl: pip install azcap[migrate-xlsx]") from e
+    try:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Workbook contains no default style", category=UserWarning)
+            book = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    except Exception as e:
+        raise MigrateError(f"Cannot read {path}: {e}") from e
+
+    def sheet_named(fragment: str):
+        for ws in book.worksheets:
+            if fragment in ws.title.lower():
+                return ws
+        return None
+
+    def rows_of(ws) -> tuple[list[str], list[list[Any]]]:
+        rows = [list(r) for r in ws.iter_rows(values_only=True)]
+        for i, row in enumerate(rows):
+            if any(c not in (None, "") for c in row):
+                headers = ["" if c is None else str(c).strip() for c in row]
+                return headers, [r for r in rows[i + 1 :] if any(c not in (None, "") for c in r)]
+        return [], []
+
+    # Assessment_Properties (Property | Selected value) and Assessment_Summary (label | value rows) carry the
+    # target region and names; both are optional and matched on the first non-empty cell.
+    props: dict[str, str] = {}
+    for fragment in ("assessment_summary", "assessment_properties"):
+        ws = sheet_named(fragment)
+        if ws is None:
+            continue
+        for row in ws.iter_rows(values_only=True):
+            cells = [c for c in row if c not in (None, "")]
+            if len(cells) >= 2:
+                props.setdefault(_norm(cells[0]), str(cells[1]).strip())
+
+    def prop(*labels: str) -> str | None:
+        return next((props[label] for label in labels if props.get(label)), None)
+
+    target = prop("target location", "target region", "azure location")
+    info: dict[str, Any] = {
+        "target_region": target.replace(" ", "").lower() if target else None,
+        "sizing_criterion": normalize_sizing_criterion(prop("sizing criterion", "sizing criteria")),
+        "comfort_factor": prop("comfort factor"),
+        "subscription": prop("subscription id", "subscription"),
+        "project": prop("project name", "project", "azure migrate project", "migrate project"),
+        "group": prop("group name", "group"),
+        "assessment": prop("assessment name", "assessment"),
+    }
+
+    machines_ws = sheet_named("assessed_machines")
+    if machines_ws is None:
+        names = ", ".join(ws.title for ws in book.worksheets)
+        raise MigrateError(f"{path}: no sheet named like 'Assessed_Machines' (sheets: {names})")
+    headers, rows = rows_of(machines_ws)
+    col_ready = _find_header(headers, "readiness")
+    col_size = _find_header(headers, "recommended size", "azure vm size", "target size")
+    col_name = _find_header(headers, "machine", "server")
+    col_os = _find_header(headers, "operating system")
+    missing = [
+        label
+        for label, col in (("readiness", col_ready), ("recommended size", col_size), ("machine name", col_name))
+        if col is None
+    ]
+    if missing:
+        raise MigrateError(
+            f"{path}: sheet '{machines_ws.title}' has no column for {', '.join(missing)}. "
+            f"Headers found: {', '.join(h for h in headers if h) or '(none)'}. "
+            "Please report these headers so detection can be fixed."
+        )
+    machines: dict[str, AssessedMachine] = {}
+    for row in rows:
+        name = str(_cell(row, col_name) or "").strip() or f"row{len(machines) + 1}"
+        size = str(_cell(row, col_size) or "").strip() or None
+        machines[name] = AssessedMachine(
+            name=name,
+            size=size,
+            suitability=_suitability_from_readiness(_cell(row, col_ready)),
+            os=_os_from_name(_cell(row, col_os)) if col_os is not None else None,
+        )
+    info.update(
+        machines_sheet=machines_ws.title, disks_sheet=None, os_column=headers[col_os] if col_os is not None else None
+    )
+    disks_ws = sheet_named("assessed_disks")
+    unattached: list[tuple[str, str]] = []
+    if disks_ws is not None:
+        info["disks_sheet"] = disks_ws.title
+        dheaders, drows = rows_of(disks_ws)
+        col_dtype = next(
+            (i for i, h in enumerate(dheaders) if "recommended disk" in h.lower() and "size" not in h.lower()), None
+        )
+        col_dsize = _find_header(dheaders, "disk size", "recommended size")
+        col_dmachine = _find_header(dheaders, "machine", "server")
+        if col_dtype is not None and col_dsize is not None:
+            for row in drows:
+                dtype = normalize_disk_type(_cell(row, col_dtype))
+                dsize = str(_cell(row, col_dsize) or "").strip()
+                if not dtype or not dsize:
+                    continue
+                owner_name = str(_cell(row, col_dmachine) or "").strip() if col_dmachine is not None else ""
+                owner = machines.get(owner_name)
+                (owner.disks if owner else unattached).append((dtype, dsize))
+        else:
+            info["disks_sheet"] = (
+                f"{disks_ws.title} (disk type/size columns not recognised; headers: {', '.join(dheaders)})"
+            )
+    info["unattached_disks"] = unattached
+    return list(machines.values()), info
+
+
+def profile_output_path(out_profile: str | None, profile: Profile, mixed: bool) -> Path:
+    """<name>.yaml in cwd by default; with mixed OS the -linux/-windows suffix is already in the profile name,
+    and an explicit --out-profile gets that suffix inserted before its extension."""
+    if not out_profile:
+        return Path(f"{profile.name}.yaml")
+    path = Path(out_profile)
+    if not mixed:
+        return path
+    suffix = "-" + profile.os.lower()
+    return path.with_name(f"{path.stem}{suffix}{path.suffix or '.yaml'}")
+
+
+def slug(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", text.strip()).strip("-") or "profile"
 
 
 def short_sku(sku: str) -> str:
@@ -1367,10 +1901,198 @@ def display_identifier(value: str, redact: bool) -> str:
     return (identifier_fingerprint(value) or "") if redact else value
 
 
+def _add_profile_build_args(sp: argparse.ArgumentParser) -> None:
+    sp.add_argument("--out-profile", metavar="PATH", help="where to write the profile (default: <name>.yaml in cwd)")
+    sp.add_argument(
+        "--conditional",
+        choices=("optional", "required", "skip"),
+        default="optional",
+        help="how to treat ConditionallySuitable machines (default: optional)",
+    )
+    sp.add_argument(
+        "--headroom",
+        type=nonnegative_int,
+        default=0,
+        metavar="PCT",
+        help="inflate each required count by ceil(count * PCT / 100) (default: 0)",
+    )
+    sp.add_argument("--name", help="profile name (default: the assessment name, or the export file's name)")
+
+
+def profile_main(argv: list[str]) -> None:
+    """`azcap profile from-migrate ...` / `azcap profile from-migrate-xlsx ...`: build a profile from Azure Migrate."""
+    ap = argparse.ArgumentParser(
+        prog="azcap profile",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Build a workload profile for `azcap --profile` from an Azure Migrate assessment.",
+        epilog="""\
+mapping:
+  Suitable                -> required VM       ConditionallySuitable -> --conditional (default optional)
+  NotSuitable / Unknown   -> excluded, tallied  no recommended size   -> excluded, tallied
+  machines are grouped by recommended size; --headroom adds ceil(count * PCT / 100) to required counts
+  mixed Linux/Windows -> one profile per OS (<name>-linux.yaml, <name>-windows.yaml)
+  zonal is written as false: Azure Migrate does not assess zone resilience — set it yourself if needed
+
+examples:
+  azcap profile from-migrate --resource-group rg-migrate --project contoso-proj --group wave1 --assessment wave1-assess
+  azcap profile from-migrate --assessment-id /subscriptions/.../assessments/wave1-assess --headroom 10
+  azcap profile from-migrate-xlsx wave1-export.xlsx --conditional required
+  azcap --regions eastus2 --profile wave1-assess.yaml --fail-on-blocked     # then judge regions against it
+""",
+    )
+    sub = ap.add_subparsers(dest="command", required=True, metavar="{from-migrate,from-migrate-xlsx}")
+
+    api = sub.add_parser("from-migrate", help="read the assessment from the Azure Migrate API")
+    api.add_argument("--project", metavar="NAME", help="assessment project name")
+    api.add_argument("--group", metavar="NAME", help="group name within the project")
+    api.add_argument("--assessment", metavar="NAME", help="assessment name within the group")
+    api.add_argument("--resource-group", metavar="RG", help="resource group holding the Migrate project")
+    api.add_argument(
+        "--assessment-id", metavar="ID", help="full ARM id of the assessment (alternative to the four name flags)"
+    )
+    api.add_argument(
+        "--subscription", metavar="ID", help="subscription id (default: $AZURE_SUBSCRIPTION_ID, else `az account show`)"
+    )
+    api.add_argument("--tenant", metavar="ID", help="Entra tenant id to authenticate against")
+    _add_profile_build_args(api)
+
+    xlsx = sub.add_parser("from-migrate-xlsx", help="read an assessment exported from the portal (.xlsx)")
+    xlsx.add_argument("export", metavar="EXPORT.XLSX", help="assessment export with an Assessed_Machines sheet")
+    _add_profile_build_args(xlsx)
+
+    args = ap.parse_args(argv)
+    source: dict[str, Any] = {"exported": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")}
+    target_region: str | None = None
+    notes: list[str] = []
+    if args.command == "from-migrate":
+        if args.assessment_id:
+            match = re.fullmatch(
+                r"/subscriptions/([^/]+)/resourceGroups/([^/]+)/providers/Microsoft\.Migrate/assessmentProjects/([^/]+)"
+                r"/groups/([^/]+)/assessments/([^/]+)/?",
+                args.assessment_id.strip(),
+                re.IGNORECASE,
+            )
+            if not match:
+                api.error(
+                    "--assessment-id must be /subscriptions/../resourceGroups/../providers/Microsoft.Migrate/"
+                    "assessmentProjects/../groups/../assessments/.."
+                )
+            subscription, resource_group, project, group, assessment = match.groups()
+        else:
+            missing = [f for f in ("project", "group", "assessment", "resource_group") if not getattr(args, f)]
+            if missing:
+                api.error(
+                    "--assessment-id or all of --project, --group, --assessment, --resource-group are required "
+                    f"(missing: {', '.join('--' + m.replace('_', '-') for m in missing)})"
+                )
+            subscription = resolve_subscription(args.subscription)
+            resource_group, project, group, assessment = args.resource_group, args.project, args.group, args.assessment
+        assessment_id = migrate_assessment_id(subscription, resource_group, project, group, assessment)
+        print(f"Reading assessment {assessment} (project {project}, group {group})", file=sys.stderr)
+        try:
+            body, resources = fetch_migrate_assessment(arm_getter(make_credential(args.tenant)), assessment_id)
+        except MigrateError as e:
+            sys.exit(str(e))
+        props = body.get("properties") if isinstance(body.get("properties"), dict) else {}
+        target_region = str(props["azureLocation"]).lower() if props.get("azureLocation") else None
+        source.update(
+            kind="azure-migrate",
+            project=project,
+            group=group,
+            assessment=assessment,
+            target_region=target_region,
+            sizing_criterion=normalize_sizing_criterion(props.get("sizingCriterion")),
+        )
+        if props.get("azureVmFamilies"):
+            notes.append(f"assessment limited to VM families: {', '.join(str(f) for f in props['azureVmFamilies'])}")
+        machines = [machine_from_api(r) for r in resources]
+        default_name = assessment
+    else:
+        path = Path(args.export)
+        try:
+            machines, info = read_migrate_xlsx(path)
+        except MigrateError as e:
+            sys.exit(str(e))
+        target_region = info.get("target_region")
+        source.update(
+            kind="azure-migrate",
+            subscription=info.get("subscription"),
+            project=info.get("project"),
+            group=info.get("group"),
+            assessment=info.get("assessment") or path.name,
+            target_region=target_region,
+            sizing_criterion=info.get("sizing_criterion"),
+            comfort_factor=info.get("comfort_factor"),
+        )
+        if info.get("unattached_disks"):
+            notes.append(f"{len(info['unattached_disks'])} disks could not be matched to a machine and were left out")
+        if info.get("os_column") is None:
+            notes.append("no 'operating system' column found; OS assumed Linux")
+        default_name = info.get("assessment") or path.stem
+    name = slug(args.name or default_name)
+    profiles, summary = build_profiles(
+        machines, name=name, conditional=args.conditional, headroom=args.headroom, source=source
+    )
+    if not profiles or not any(p.vms for p in profiles):
+        sys.exit(
+            f"No machines to build a profile from: {summary['by_suitability'] or 'no machines'}; "
+            f"excluded {summary['excluded']}"
+        )
+    written: list[tuple[Profile, Path]] = []
+    for profile in profiles:
+        if not profile.vms:
+            continue
+        out = profile_output_path(args.out_profile, profile, summary["mixed_os"])
+        try:
+            out.write_text(profile_to_yaml(profile), encoding="utf-8")
+        except OSError as e:
+            sys.exit(f"Cannot write {out}: {e}")
+        written.append((profile, out))
+
+    # summary
+    print(f"\nMachines: {len(machines)} assessed")
+    for suit in (*MIGRATE_SUITABILITIES, *sorted(set(summary["by_suitability"]) - set(MIGRATE_SUITABILITIES))):
+        n = summary["by_suitability"].get(suit)
+        if n:
+            print(f"  {suit:<24} {n:4d}")
+    if summary["excluded"]:
+        print("  excluded: " + ", ".join(f"{k} {v}" for k, v in summary["excluded"].items()))
+    for text, n in sorted(summary["explanations"].items(), key=lambda kv: -kv[1])[:5]:
+        print(f"    {n:4d} x {text}")
+    for profile, out in written:
+        print(f"\nProfile {profile.name} ({profile.os}) -> {out}")
+        for vm in profile.vms:
+            print(f"  {vm.sku:<32} x{vm.count:<5}{'optional' if vm.optional else 'required'}")
+        if profile.disks:
+            print("  disks: " + ", ".join(f"{d['type']} {d['size']} x{d['count']}" for d in profile.disks))
+    if summary["headroom"]:
+        print(f"\nRequired counts include {summary['headroom']}% headroom.")
+    if summary["unknown_os"]:
+        majority = summary["majority_os"]
+        print(f"{summary['unknown_os']} machine(s) with unknown OS were counted with the majority ({majority}).")
+    if summary["mixed_os"]:
+        print("Mixed Linux and Windows machines: one profile per OS was written.")
+    for note in notes:
+        print(note)
+    print(
+        "zonal is false in the profile: Azure Migrate does not assess zone resilience. "
+        "Set zonal: true if the design must span availability zones."
+    )
+    region = target_region or "<region>"
+    if target_region:
+        print(f"Target region in the assessment: {target_region}")
+    print("\nNext:")
+    for _profile, out in written:
+        print(f"  azcap --regions {region} --profile {out} --fail-on-blocked")
+
+
 def main() -> None:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(errors="replace")
+    if sys.argv[1:2] == ["profile"]:
+        profile_main(sys.argv[2:])
+        return
     ap = argparse.ArgumentParser(
         prog="azcap",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1432,6 +2154,10 @@ exit codes:
 
 auth: Azure CLI login by default (any DefaultAzureCredential source works).
       az login [--tenant <id>]   then   az account list -o table   to see what you're signed into.
+
+profiles from Azure Migrate:
+  azcap profile from-migrate --help          build a workload profile from an assessment (API)
+  azcap profile from-migrate-xlsx --help     ... or from a portal .xlsx export
 """,
     )
     ap.add_argument("--version", action="version", version=f"%(prog)s {package_version()}")

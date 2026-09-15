@@ -194,7 +194,9 @@ vms:                              # required, at least one
     optional: true                # default false; optional VMs are reported but never block
 ```
 
-Unknown keys, missing fields, wrong types, an empty `vms`, and duplicate SKUs are rejected up front.
+Unknown keys, missing fields, wrong types, and an empty `vms` are rejected up front. A SKU may appear
+twice only as one required and one optional entry (they share the family's quota; each gets its own
+verdict); listing it twice with the same `optional` flag is rejected.
 `--profile` implies `--include-quota` and a placement probe for each VM that is not already decided by
 steps 1–3 below (so it cannot be combined with `--need`); the profile's `zonal` controls the probe zones
 and the zone check, while `--zonal` still only narrows the restriction scan.
@@ -207,7 +209,8 @@ wins:
    blocked in all but one zone cannot be placed zone-resiliently), including regions with no zones.
 3. **quota** — the family's vCPU quota is 0, or the free vCPUs are fewer than the profile needs.
    Needs are summed per family across the profile's required VMs before checking, since two SKUs
-   in the same family share one quota; an optional VM is checked on top of that total.
+   in the same family share one quota; an optional VM is checked on top of that total. The reason
+   shows both figures: `family need 160 vCPU (this SKU 80)`.
 4. **capacity** — the placement probe could not place the request (`InsufficientCapacity`).
 5. **deployable** — the probe placed it. If the probe failed (preview API error) the VM is
    **unknown**: restrictions and quota allow it, but capacity could not be checked.
@@ -245,12 +248,73 @@ Workload "wave1" (zonal, Linux):
   brazilsouth            BLOCKED     capacity: Standard_D8s_v5 (score 2, 6 of 12 placed); optional: NC24ads_A100_v4 restricted
                                      pair: both blocked — brazilsouth: cannot place Standard_D8s_v5; pair: quota blocks Standard_D8s_v5
   centralus              deployable  D8s_v5 x12 placed (score 7), E16s_v5 x4 placed (score 6), NC24ads_A100_v4 x1 restricted (optional)  (pair of eastus2)
-  southcentralus         BLOCKED     quota: Standard_D8s_v5 (standardDSv5Family limit 0, need 96 vCPU)  (pair of brazilsouth)
+  southcentralus         BLOCKED     quota: Standard_D8s_v5 (standardDSv5Family limit 0, family need 96 vCPU (this SKU 96))  (pair of brazilsouth)
 ```
 
 A verdict is as good as its inputs: restrictions and quota are current, but a placement score is a
 hypothetical allocation at the time of the run, not a reservation. Use it to pick and gate, then
 reserve capacity if the deployment cannot tolerate `AllocationFailed`.
+
+Two optional keys carry provenance when a profile was generated (see below); the verdict logic ignores
+them for now: `source` (where the profile came from and machine tallies) and `disks`
+(`[{type: Premium_LRS, size: P30, count: 12}]`, the recommended managed disks).
+
+## Build a profile from Azure Migrate
+
+If the workload was assessed in Azure Migrate, the assessment already names the target size for every
+machine. `azcap profile` turns it into a profile, either from the API or from the portal's Excel export:
+
+```bash
+# from the Azure Migrate API (needs Reader on the Migrate project; same az login as everything else)
+azcap profile from-migrate --resource-group rg-migrate --project contoso-proj --group wave1 --assessment wave1-assess
+azcap profile from-migrate --assessment-id /subscriptions/<sub>/resourceGroups/rg-migrate/providers/Microsoft.Migrate/assessmentProjects/contoso-proj/groups/wave1/assessments/wave1-assess
+
+# from an export (Assessment > Export to Excel); needs the optional openpyxl extra
+pip install 'azcap[migrate-xlsx]'
+azcap profile from-migrate-xlsx wave1-export.xlsx
+```
+
+Common options: `--out-profile PATH` (default `<name>.yaml` in the current directory), `--name`,
+`--conditional {optional,required,skip}`, `--headroom PCT`; the API command also takes
+`--subscription` / `--tenant`.
+
+Mapping rules:
+
+- **Suitable** machines become required VMs. **ConditionallySuitable** machines follow `--conditional`:
+  `optional` (default) reports them without blocking, `required` counts them fully, `skip` leaves
+  them out. **NotSuitable** and **Unknown** machines are excluded and tallied, with their
+  `suitabilityExplanation` counted in the summary, as are machines with no recommended size.
+- Machines are grouped by recommended size into `sku` / `count`. When suitable and conditionally
+  suitable machines share a size the profile gets two entries for that SKU, one required and one optional.
+- `--headroom PCT` adds `ceil(count × PCT / 100)` to each required count.
+- **OS**: one profile if every machine agrees; otherwise one profile per OS (`<name>-linux.yaml`,
+  `<name>-windows.yaml`, each with `os` set). Machines whose OS Migrate reports as "other" go with the
+  majority and are noted.
+- `zonal` is written as `false` because Migrate does not assess zone resilience — set it to `true` if
+  the design must span zones.
+- `source` records the subscription, project, group, assessment, target region, sizing criterion,
+  comfort factor, export time, and machine tallies; `disks` aggregates the recommended disk type and
+  size using the API's names (`Premium Premium_P30 × 12`, types Premium / StandardSSD / Standard /
+  Ultra / PremiumV2) so both importers write the same block.
+
+The command prints machines by suitability, the resulting SKU counts, the disks, the assessment's
+target region, and the follow-up:
+
+```bash
+azcap --regions eastus2 --profile wave1-assess.yaml --fail-on-blocked
+```
+
+The Excel reader is calibrated against a current portal export (sheets `Assessment_Summary`,
+`All_Assessed_Machines`, `All_Assessed_Disks`, `Assessment_Properties`). It finds the sheets by name
+fragment and columns by header text — "readiness", "recommended size" / "azure vm size" / "target size",
+"machine" / "server", "operating system", and for disks "recommended disk" (type) / "disk size" (SKU).
+Readiness wording maps as `Ready` → Suitable, `Ready With Conditions` / `Conditionally ready` →
+ConditionallySuitable, `Not Ready` → NotSuitable, anything else → Unknown; disk types such as
+"Premium managed disks" are normalised to the API names. `Assessment_Properties` supplies the target
+location (`East US 2` → `eastus2`, used in the printed follow-up command), sizing criterion, and comfort
+factor; `Assessment_Summary` supplies the subscription, project, group, and assessment names when
+present. If a required column is not found it lists the headers it saw — please report them; other
+export layouts may need the heuristics extended.
 
 ## Caveats
 
@@ -283,6 +347,8 @@ python -m build
 
 `python fixtures/make_fixture.py` regenerates `fixtures/sample.json` and `fixtures/wave1.yaml`; the
 fixture pins eastus2 / centralus / brazilsouth / southcentralus so a profile run shows every verdict.
+`fixtures/migrate_sample.py` holds a synthetic Azure Migrate assessment (API pages and an .xlsx export)
+used by the tests; run it to write `fixtures/migrate_sample.xlsx` and try `azcap profile from-migrate-xlsx` on it.
 
 ## Extending
 

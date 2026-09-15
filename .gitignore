@@ -13,3 +13,5 @@ _old/
 .pytest_cache/
 .ruff_cache/
 smoke.yaml
+fixtures/migrate_sample.xlsx
+/*.yaml

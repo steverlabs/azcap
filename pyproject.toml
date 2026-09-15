@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "azcap"
-version = "0.4.0"
-description = "Azure VM capacity scanner — SKU restrictions, placement probes, and workload verdicts per region, family, zone, and paired region"
+version = "0.5.0"
+description = "Azure VM capacity scanner — SKU restrictions, placement probes, and workload verdicts per region, family, zone, and paired region; profiles from Azure Migrate"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -25,8 +25,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+migrate-xlsx = [
+  "openpyxl>=3.1",
+]
 dev = [
   "build>=1.2",
+  "openpyxl>=3.1",
   "pytest>=8",
   "ruff>=0.8",
 ]

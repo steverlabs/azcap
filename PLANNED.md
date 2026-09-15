@@ -2,7 +2,7 @@
 
 Ranked by how much each would change a real deployment decision. Items are independent; none
 is scheduled. Item 1 shipped in 0.3.0 (the only one that adds information Microsoft holds about
-capacity rather than another view of restrictions) and item 2 in 0.4.0.
+capacity rather than another view of restrictions), item 2 in 0.4.0, and item 2b in 0.5.0.
 
 ## 1. Placement scores (Compute Recommender) — done (0.3.0)
 
@@ -33,6 +33,22 @@ blocked, and optional VMs never block. Pairs carry both verdicts and a DR note. 
 
 Possible follow-up: workload-weighted scoring — the profile is now the workload definition that
 idea was waiting for, so the heatmap could weight families by what the profile actually deploys.
+
+## 2b. Profiles from Azure Migrate assessments — done (0.5.0)
+
+`azcap profile from-migrate` (API: assessment + paged assessedMachines, api-version 2023-03-15) and
+`azcap profile from-migrate-xlsx` (portal export via the optional `openpyxl` extra) write a profile
+from an assessment: Suitable → required, ConditionallySuitable → `--conditional`, NotSuitable /
+Unknown / no size → excluded and tallied; grouped by recommended size; `--headroom`; one profile
+per OS when mixed; `zonal: false` with a reminder. The profile schema gained optional `source`
+and `disks` blocks that the verdict logic records but does not judge yet.
+
+Caveat: Excel detection is heuristic (substring matches on "readiness", "recommended size",
+"machine", "operating system", "recommended disk", "disk size"), calibrated against one real export
+(2026-09: sheets Assessment_Summary / All_Assessed_Machines / All_Assessed_Disks /
+Assessment_Properties, readiness "Ready" / "Ready With Conditions", disk types "Premium managed
+disks"); a missing column lists the headers found so other layouts can be reported. Possible follow-ups: judge `disks`
+against disk SKU availability (item 3), and read the `azureVmFamilies` filter into the scan scope.
 
 ## 3. Other resource types from the same Resource SKUs API
 
