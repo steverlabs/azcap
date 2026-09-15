@@ -70,6 +70,13 @@
   .pill.zone_restricted::before { background: var(--text-2); border-color: var(--text-2); clip-path: inset(0 50% 0 0); }
   .pill.region_restricted::before { background: var(--text); border-color: var(--text); }
   .pill.quota_blocked::before { border-style: dashed; }
+  /* placement probe outcomes: same shapes as SKU statuses so the two tables read alike */
+  .pill.placed { color: var(--text-2); }
+  .pill.placed::before { border-color: var(--text-3); }
+  .pill.insufficient_capacity::before { background: var(--text); border-color: var(--text); }
+  .pill.insufficient_quota::before { border-style: dashed; }
+  .pill.error, .pill.unknown { color: var(--text-3); }
+  .pill.error::before, .pill.unknown::before { border-style: dotted; }
   .controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 10px; }
   .controls input, .controls select { font: inherit; padding: 5px 8px; border: 1px solid var(--line);
                                        border-radius: 6px; background: var(--panel); color: var(--text); }
@@ -111,6 +118,15 @@
       are newer regions Microsoft launched unpaired; DR there is a region you choose, not a pair.</p>
     <div class="scroll"><table id="pairs"></table></div>
     <div id="pairFam"></div>
+  </div>
+
+  <div id="probesBlock" hidden>
+    <h2>Placement probes</h2>
+    <p class="note">Each row asks whether the requested number of VMs would place in that region right now and shows the best
+      answer: a score from 0 (worst) to 9 (best), whether the full request was placed, and how it would be split across
+      SKUs and zones. Placement scores come from Microsoft's Compute Recommender (preview) and describe a hypothetical
+      allocation at the time of the run; they are not a reservation.</p>
+    <div class="scroll"><table id="probes"></table></div>
   </div>
 
   <h2>Zone-level restrictions</h2>
@@ -179,6 +195,7 @@ function seqInk(score) {
     (m.sku_glob ? ` · sku <code>${esc(m.sku_glob)}</code>` : "") +
     (m.exclude_families?.length ? ` · excluding <code>${esc(m.exclude_families.join(", "))}</code>` : "") +
     (m.zonal_only ? ` · <b>zonal SKUs only</b>` : "") +
+    (m.need?.length ? ` · placement probes <code>${esc(m.need.map(n => n.sku + " x" + n.count).join(", "))}</code>${m.need_mix ? " as one mix" : ""}${m.probe_spot ? " (spot)" : ""} on ${esc(m.probe_os ?? "Linux")}` : "") +
     ` · region weighting <code>${esc(m.region_weighting ?? "sku")}</code>` +
     (m.identifiers_redacted ? ` · <b>identifiers redacted</b>` : "") +
     (m.not_visible?.length ? `<br><b>Not visible to this subscription (skipped):</b> <code>${esc(m.not_visible.join(", "))}</code> — region not enabled for this subscription or misspelled` : "") +
@@ -267,6 +284,7 @@ function seqInk(score) {
       if (p.pair_zonal === false) flags.push("pair has no availability zones");
       if (p.pair_has_data === false) flags.push("no SKUs evaluated in pair (filtered out)");
       if (p.both_constrained.length) flags.push("both constrained: " + p.both_constrained.join(", "));
+      if (p.placement_notes?.length) flags.push(...p.placement_notes);
     }
     h += `<tr><th class="rowh">${esc(p.region)}</th><td>${esc(p.geography ?? "")}</td><td>${p.zonal ? "yes" : "no"}</td>${cell(p.score)}` +
          `<td>${esc(p.pair ?? "—")}</td><td>${esc(p.pair_geography ?? "")}</td><td>${p.pair ? (p.pair_zonal ? "yes" : "no") : ""}</td>${cell(p.pair_score)}` +
@@ -289,6 +307,38 @@ function seqInk(score) {
     f += `</tbody></table></div>`;
   }
   $("#pairFam").innerHTML = f;
+})();
+
+// ---- placement probes
+(function () {
+  const P = DATA.probes || [];
+  if (!P.length) return;
+  $("#probesBlock").hidden = false;
+  const LABEL = { None: "placed", InsufficientCapacity: "insufficient capacity", InsufficientQuota: "insufficient quota" };
+  const PILL = { None: "placed", InsufficientCapacity: "insufficient_capacity", InsufficientQuota: "insufficient_quota" };
+  // reuse the restriction ramp inverted: 9 (best) is lightest, 0 (worst) darkest; the number is always shown
+  const scoreCell = s => s == null ? `<td class="num">—</td>` :
+    `<td class="num" style="background:${seqVar(100 - s * 100 / 9)};color:${seqInk(100 - s * 100 / 9)}">${s}</td>`;
+  const range = (lo, hi) => lo === hi ? String(lo) : `${lo}–${hi}`;
+  let h = `<thead><tr><th>region</th><th>request</th><th>scope</th><th class="num">score (0–9)</th><th>result</th>
+           <th class="num">requested</th><th class="num">fulfilled</th><th>split</th><th>valid until</th></tr></thead><tbody>`;
+  for (const p of P) {
+    const mix = p.sku === "mix";
+    const req = (mix ? p.skus.join(" + ") : p.sku) + (p.spot ? " (spot)" : "");
+    const base = p.error ? "error" : (p.fulfillment == null ? "unknown" : (LABEL[p.fulfillment] ?? p.fulfillment));
+    const label = p.detail && !p.error ? `${base}: ${p.detail}` : base;
+    const pill = p.error ? "error" : (PILL[p.fulfillment] ?? "unknown");
+    const lo = p.split.reduce((a, s) => a + (s.capacity ?? 0), 0);
+    const hi = p.split.reduce((a, s) => a + (s.capacity_max ?? s.capacity ?? 0), 0);
+    const split = p.split.map(s => `${mix ? esc(s.name) + " " : ""}${s.zone ? "zone " + esc(s.zone) + ": " : ""}${range(s.capacity ?? 0, s.capacity_max ?? s.capacity ?? 0)}`).join(", ");
+    const pairOf = DATA.meta.pair_of?.[p.region];
+    h += `<tr><th class="rowh">${pairOf ? "↳ " : ""}${esc(p.region)}${pairOf ? ` <span class="warn" style="font-weight:400">· pair of ${esc(pairOf)}</span>` : ""}</th>` +
+         `<td>${esc(req)}</td><td>${p.zonal ? "zonal" : "regional"}</td>${scoreCell(p.score)}` +
+         `<td style="white-space:normal;min-width:180px"><span class="pill ${pill}">${esc(label)}</span>${p.error ? ` <span class="warn">${esc(p.error)}</span>` : ""}</td>` +
+         `<td class="num">${p.count}</td><td class="num">${p.error ? "" : range(lo, hi)}</td>` +
+         `<td style="white-space:normal;min-width:200px">${split || (p.error ? "" : "—")}</td><td>${esc(p.valid_until ?? "")}</td></tr>`;
+  }
+  $("#probes").innerHTML = h + "</tbody>";
 })();
 
 // ---- zone-level restrictions

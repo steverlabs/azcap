@@ -67,6 +67,9 @@ azcap --regions eastus,eastus2 --region-weighting family
 # create shareable artifacts without tenant/subscription names or ids
 azcap --regions eastus --redact-identifiers
 
+# ask whether 12 x Standard_D8s_v5 would place across zones in each region right now
+azcap --regions eastus2,brazilsouth --zonal --need Standard_D8s_v5:12
+
 # offline / demo with synthetic data
 python fixtures/make_fixture.py   # generates fixtures/sample.json
 azcap --regions eastus,brazilsouth,saudiarabiaeast --fixture fixtures/sample.json
@@ -76,10 +79,11 @@ Outputs land in `--out` (default `out/`):
 
 | file | contents |
 |---|---|
-| `report.html` | heatmap (region × family), zone-level restrictions, quota headroom, changes, filterable SKU table |
+| `report.html` | heatmap (region × family), paired regions, placement probes, zone-level restrictions, quota headroom, changes, filterable SKU table |
 | `summary.csv` | one row per region × family with counts, assessed count, and zone-adjusted % restricted |
 | `skus.csv` | one row per region × SKU with status, zones, reason codes |
-| `pairs.csv` | one row per requested region: pair, geography match, zone support, both-side scores |
+| `pairs.csv` | one row per requested region: pair, geography match, zone support, both-side scores, placement notes |
+| `probes.csv` | with `--need`: one row per region × placement probe — score, result, quota detail, SKU/zone split |
 | `quota.csv` | with `--include-quota`: used vs limit per family |
 | `raw.json` | normalized API snapshot — keep it, pass as `--compare` next run |
 
@@ -115,13 +119,65 @@ sides. Regions Microsoft launched without a pair (most regions since ~2021, incl
 and Saudi Arabia East) are reported as unpaired — DR for those is a region you pick, and the tool
 can't pick it for you; pass both regions explicitly and compare rows.
 
+## Placement probes
+
+Restrictions say what Microsoft *won't* allocate; they say nothing about whether a specific request
+*would* place today. Microsoft's Compute Recommender does: given a SKU, a count, and optionally zones,
+it returns a **placement score from 0 (worst) to 9 (best)** for the best way it found to place that
+request, whether the full request was placed, and — if not — whether the shortfall is
+**insufficient capacity** or **insufficient quota**. That is the only capacity signal Azure exposes,
+and it is subscription-specific like everything else here. `--need` sends one such probe per region
+in the scan (pairs included) and puts the answer next to the restriction data: in the report
+(“Placement probes” section, plus “pair can place / neither side can place / quota blocks … on the pair”
+flags on the paired-regions table — quota and capacity verdicts are never merged into one note), the
+console, `probes.csv`, and `raw.json`.
+
+The API is **preview** (`skuMixPlacementScores`, `2026-05-05-preview`); when ARM moves to a newer
+version, pass it with `--probe-api-version` rather than waiting for a release. A probe that fails (404
+in a region where the provider isn't registered, 400 for a SKU it doesn't know, 403, a non-JSON body)
+is recorded as an `error` row and reported on stderr; it never changes the restriction figures or the
+exit code. Scores describe a hypothetical allocation at the time of the run and expire (`valid until`
+is shown); they are not a reservation. For committed capacity use On-demand Capacity Reservations.
+
+**A probe needs quota headroom in the SKU's family before it can say anything about capacity.** When
+the family's vCPU quota is at its limit the API answers with a quota verdict instead of a placement,
+shown as `insufficient quota: standardDSv5Family`. With `--include-quota` the tool checks each probe
+against the family's quota first (limit 0, or fewer free vCPUs than the request needs) and records
+`insufficient quota: limit N, used U, need M vCPU` without calling the API. On pay-as-you-go
+subscriptions whole generations (e.g. every v5 family) can have zero quota, so an "insufficient quota"
+row there means "request quota first", not "the region is full".
+
+`--need SKU:COUNT[,SKU:COUNT...]` — each `SKU:COUNT` is a separate probe. With `--zonal` the probe
+asks for zonal placement across the zones that SKU is offered in (regions without zones fall back to a
+regional probe and are labelled `regional`); without it the probe is regional. `--os Windows` and
+`--spot` change the OS and priority sent; `--need-mix` sends every SKU in one request, ranked in the
+order given, and lets Azure pick the split.
+
+```bash
+# will 12 x Standard_D8s_v5 place across zones in eastus2 and brazilsouth (and their pairs)?
+azcap --regions eastus2,brazilsouth --zonal --need Standard_D8s_v5:12
+
+# 16 VMs from a ranked mix: prefer D8s_v5, fall back to E8s_v5, Windows, regional placement
+azcap --regions eastus,westeurope --need Standard_D8s_v5:12,Standard_E8s_v5:4 --need-mix --os Windows
+```
+
+Console output, one line per region × probe:
+
+```
+Placement probes (regular VMs, Linux; Compute Recommender preview):
+  eastus2                Standard_D8s_v5 x12   zonal   score 7  placed                 split 1:4 2:4 3:4
+  brazilsouth            Standard_D8s_v5 x12   zonal   score 2  insufficient capacity  split 1:2 2:2 3:2
+  canadacentral          Standard_D8s_v5 x12   zonal   score -  insufficient quota: standardDSv5Family
+```
+
 ## Caveats
 
 - Everything here is **per subscription**. Restrictions can differ from one subscription to another,
   including between EA, CSP, and pay-as-you-go offers. Run it under the subscription that will deploy.
 - Absence of a restriction is not a capacity guarantee. `AllocationFailed` /
-  `OverconstrainedAllocationRequest` at deploy time can still happen. For committed capacity use
-  On-demand Capacity Reservations.
+  `OverconstrainedAllocationRequest` at deploy time can still happen. `--need` asks the Compute
+  Recommender whether a specific request would place right now, which is closer, but still not a
+  guarantee. For committed capacity use On-demand Capacity Reservations.
 - Region access restrictions (regions that require an access request to deploy at all) are not
   in this API; your account team or the Azure portal quota blade will show those.
 - The API reflects Microsoft's current allocation policy, which changes without notice. Take

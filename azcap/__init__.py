@@ -32,12 +32,21 @@ This is a subscription-specific availability proxy, not a published Azure
 capacity percentage. All data is subscription-specific; run it under the subscription
 that will actually deploy, not a sandbox.
 
+Placement probes (--need)
+-------------------------
+  Asks Microsoft's Compute Recommender (preview) whether a proposed allocation, e.g.
+  12 x Standard_D8s_v5, would place in each scanned region right now: a score from
+  0 (worst) to 9 (best), whether the full request was placed, and the SKU/zone split.
+  This is the only capacity signal Azure exposes; it describes a hypothetical
+  allocation at the time of the run and is not a reservation.
+
 Usage
 -----
   python azcap.py --regions eastus,eastus2,canadacentral --families Dv5,Ev5,NC
   python azcap.py --regions saudiarabiaeast --include-quota --out ./out
   python azcap.py --regions eastus --fixture fixtures/sample.json   # offline
   python azcap.py --regions eastus --compare out/previous/raw.json  # diff
+  python azcap.py --regions eastus2,brazilsouth --zonal --need Standard_D8s_v5:12
 
 Auth: DefaultAzureCredential (az login, env vars, managed identity, etc.).
 Subscription: --subscription, else AZURE_SUBSCRIPTION_ID, else `az account show`.
@@ -52,11 +61,13 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
@@ -107,6 +118,38 @@ class FamilySummary:
     score: float | None  # 0..100; None when quota restrictions exclude every SKU
     zone_slots_total: int
     zone_slots_blocked: int
+
+
+@dataclass
+class ProbeResult:
+    """One Compute Recommender placement probe: would `count` VMs of `sku` place in `region` right now?"""
+
+    region: str
+    sku: str  # SKU name, or "mix" when several SKUs were sent as one ranked request (see `skus`)
+    count: int  # VMs requested (the total across SKUs for a mix)
+    zonal: bool  # zones were sent; False means a regional placement
+    spot: bool
+    score: int | None  # 0 (worst) .. 9 (best) of the best placement choice; None if nothing placed or on error
+    fulfillment: str | None  # API value: "None" (fully placed), "InsufficientCapacity", "InsufficientQuota"
+    split: list[dict]  # [{name, zone, capacity, capacity_max}] of the best placement choice
+    valid_until: str | None
+    error: str | None  # "<status> <short message>" when the probe failed; the row is otherwise empty
+    detail: str | None = None  # why: the quota family the API named, or the quota figures a pre-check tripped on
+    skus: list[str] = field(default_factory=list)  # every SKU in the request, in rank order
+
+
+ARM_ENDPOINT = "https://management.azure.com"
+ARM_SCOPE = "https://management.azure.com/.default"
+# Preview API; the version string changes every few months. The doc site already shows a newer one that
+# ARM does not yet accept, so live-verified is what ships here.
+PROBE_API_VERSION = "2026-05-05-preview"  # override with --probe-api-version when ARM moves on
+# ARM answers 409 with this message instead of a placement when the family has no quota headroom
+QUOTA_LIMIT_MESSAGE = re.compile(r"vCPU quota for (\S+?) has reached its limit", re.IGNORECASE)
+PROBE_LABELS = {
+    "None": "placed",
+    "InsufficientCapacity": "insufficient capacity",
+    "InsufficientQuota": "insufficient quota",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -255,6 +298,306 @@ def fetch_quota_live(credential, subscription: str, regions: list[str]) -> list[
                 )
             )
     return rows
+
+
+# --------------------------------------------------------------------------- #
+# Placement probes (Compute Recommender)
+# --------------------------------------------------------------------------- #
+
+
+def parse_need(text: str) -> list[tuple[str, int]]:
+    """'Standard_D8s_v5:12,Standard_E8s_v5:4' -> [('Standard_D8s_v5', 12), ('Standard_E8s_v5', 4)]"""
+    needs: list[tuple[str, int]] = []
+    for item in text.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        sku, sep, count = item.rpartition(":")
+        sku, count = sku.strip(), count.strip()
+        if not sep or not sku or any(c.isspace() for c in sku) or not count.isdigit() or int(count) < 1:
+            raise ValueError(f"--need entries must look like SKU:COUNT with a count of 1 or more, got {item!r}")
+        if any(sku.lower() == existing.lower() for existing, _ in needs):
+            raise ValueError(f"--need lists {sku} more than once")
+        needs.append((sku, int(count)))
+    if not needs:
+        raise ValueError("--need must name at least one SKU:COUNT")
+    return needs
+
+
+def probe_request_body(
+    needs: list[tuple[str, int]], *, os_type: str = "Linux", spot: bool = False, zones: list[str] | None = None
+) -> dict:
+    """Body for skuMixPlacementScores: one ranked request for every SKU in `needs` (rank = position)."""
+    profile: dict[str, Any] = {
+        "capacity": sum(count for _, count in needs),
+        "capacityType": "VM",
+        "priority": "Spot" if spot else "Regular",
+        "allocationStrategy": "Prioritized",
+        "osType": os_type,
+    }
+    if spot:
+        profile["spotPriorityProfile"] = {"maxPricePerVm": -1}
+    body: dict[str, Any] = {
+        "capacityProfile": profile,
+        "instanceDescription": {"vmSizes": [{"name": sku, "rank": rank} for rank, (sku, _) in enumerate(needs)]},
+    }
+    if zones:
+        body["zones"] = list(zones)
+    return body
+
+
+def probe_zones(raw: list[dict], locs: dict[str, dict], region: str, skus: list[str]) -> list[str]:
+    """Zones to send for a zonal probe: the zones the requested SKUs are actually offered in, in that region."""
+    if not (locs.get(region) or {}).get("zonal"):
+        return []
+    wanted = {s.lower() for s in skus}
+    zones: set[str] = set()
+    for r in raw:
+        if r.get("region") == region and str(r.get("name", "")).lower() in wanted:
+            zones.update(str(z) for z in r.get("zones") or [])
+    return sorted(zones)
+
+
+def _score_of(choice: dict) -> int:
+    score = _to_int(choice.get("score"))
+    return -1 if score is None else score
+
+
+def empty_probe_fields(**overrides: Any) -> dict:
+    """The answer-shaped part of a ProbeResult with nothing in it, plus any fields given."""
+    fields: dict[str, Any] = {
+        "score": None,
+        "fulfillment": None,
+        "split": [],
+        "valid_until": None,
+        "error": None,
+        "detail": None,
+    }
+    fields.update(overrides)
+    return fields
+
+
+def parse_probe_response(payload: Any) -> dict:
+    """Reduce a skuMixPlacementScores response to the fields azcap reports. Never raises."""
+    if not isinstance(payload, dict) or not isinstance(payload.get("placementChoices", []), list):
+        return empty_probe_fields(error="unexpected response shape")
+    choices = [c for c in payload.get("placementChoices") or [] if isinstance(c, dict)]
+    best = max(choices, key=_score_of, default=None)
+    split: list[dict] = []
+    if best is not None:
+        for item in best.get("skuSplit") or []:
+            if not isinstance(item, dict):
+                continue
+            capacity = _to_int(item.get("capacity"))
+            capacity_max = _to_int(item.get("capacityMax")) if item.get("capacityMax") is not None else capacity
+            split.append(
+                {
+                    "name": str(item.get("name") or ""),
+                    "zone": str(item.get("zone")) if item.get("zone") not in (None, "") else None,
+                    "capacity": capacity,
+                    "capacity_max": capacity_max,
+                }
+            )
+    reason = payload.get("partialFulfillmentReason")
+    return empty_probe_fields(
+        score=_score_of(best) if best is not None and _score_of(best) >= 0 else None,
+        fulfillment=str(reason) if reason is not None else None,
+        split=split,
+        valid_until=str(payload["validUntil"]) if payload.get("validUntil") else None,
+    )
+
+
+def _short_error(status: int, payload: Any, text: str) -> str:
+    message = ""
+    if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
+        err = payload["error"]
+        message = str(err.get("message") or err.get("code") or "")
+    message = " ".join((message or text or "").split())
+    return f"{status} {message[:120]}".strip()
+
+
+def probe_once(post, url: str, body: dict, sleep=time.sleep) -> dict:
+    """POST one probe; retry once on 429 honoring Retry-After. Returns parse_probe_response() fields, never raises."""
+    try:
+        status, headers, text = post(url, body)
+        if status == 429:
+            retry_after = {str(k).lower(): v for k, v in dict(headers or {}).items()}.get("retry-after")
+            sleep(min(max(_to_int(retry_after) or 5, 1), 60))
+            status, headers, text = post(url, body)
+    except Exception as e:
+        message = " ".join(f"request failed: {type(e).__name__}: {e}".split())[:160]
+        return empty_probe_fields(error=message)
+    try:
+        payload = json.loads(text) if text else None
+    except ValueError:
+        payload = None
+    if status == 409:
+        # a quota verdict, not a failure: the API refuses to place anything in a family at its vCPU limit
+        match = QUOTA_LIMIT_MESSAGE.search(_short_error(status, payload, text))
+        if match:
+            return empty_probe_fields(fulfillment="InsufficientQuota", detail=match.group(1))
+    if status != 200:
+        return empty_probe_fields(error=_short_error(status, payload, text))
+    if payload is None:
+        return empty_probe_fields(error="200 response body is not JSON")
+    return parse_probe_response(payload)
+
+
+def arm_poster(credential):
+    """A `post(url, body) -> (status, headers, text)` for ARM using a bearer token from the credential.
+    The token is fetched on first use so an auth failure surfaces as a per-probe error, not an abort."""
+    import requests
+
+    session = requests.Session()
+    state: dict[str, Any] = {}
+
+    def post(url: str, body: dict) -> tuple[int, Any, str]:
+        if "token" not in state:
+            state["token"] = credential.get_token(ARM_SCOPE).token
+        headers = {"Authorization": f"Bearer {state['token']}", "Content-Type": "application/json"}
+        r = session.post(url, json=body, headers=headers, timeout=60)
+        return r.status_code, r.headers, r.text
+
+    return post
+
+
+def quota_precheck(raw: list[dict], quota: list[QuotaRow], region: str, group: list[tuple[str, int]]) -> str | None:
+    """Reason the request cannot fit in the family's vCPU quota, or None when it fits or can't be judged.
+
+    A probe only says something about capacity once quota headroom exists, so this saves a call that
+    would come back InsufficientQuota anyway. Skips silently when the SKU or family isn't in the scan."""
+    skus_in_region = {str(r.get("name", "")).lower(): r for r in raw if r.get("region") == region}
+    need_by_family: dict[str, int] = defaultdict(int)
+    for sku, count in group:
+        entry = skus_in_region.get(sku.lower())
+        vcpus = _to_int((entry or {}).get("capabilities", {}).get("vCPUs")) if entry else None
+        family = str((entry or {}).get("family") or "").strip()
+        if not family or vcpus is None:
+            continue
+        need_by_family[family.lower()] += vcpus * count
+    quota_in_region = {q.family.lower(): q for q in quota if q.region == region}
+    for family, need in need_by_family.items():
+        q = quota_in_region.get(family)
+        if q is None:
+            continue
+        if q.limit == 0 or q.limit - q.current < need:
+            prefix = f"{q.family}: " if len(group) > 1 else ""
+            return f"{prefix}limit {q.limit}, used {q.current}, need {need} vCPU"
+    return None
+
+
+def run_probes(
+    post,
+    subscription: str,
+    regions: list[str],
+    needs: list[tuple[str, int]],
+    *,
+    mix: bool,
+    os_type: str,
+    spot: bool,
+    zonal: bool,
+    raw: list[dict],
+    locs: dict[str, dict],
+    api_version: str = PROBE_API_VERSION,
+    quota: list[QuotaRow] | None = None,
+    sleep=time.sleep,
+) -> list[ProbeResult]:
+    """One probe per region per SKU (or one per region for the whole mix). Failures become error rows.
+    With `quota`, a request the family's vCPU quota cannot hold is answered locally instead of sent."""
+    groups = [needs] if mix else [[n] for n in needs]
+    results: list[ProbeResult] = []
+    for region in regions:
+        for group in groups:
+            skus = [sku for sku, _ in group]
+            zones = probe_zones(raw, locs, region, skus) if zonal else []
+            body = probe_request_body(group, os_type=os_type, spot=spot, zones=zones)
+            url = (
+                f"{ARM_ENDPOINT}/subscriptions/{subscription}/providers/Microsoft.Compute/locations/{region}"
+                f"/skuMixPlacementScores/recommendations/generate?api-version={api_version}"
+            )
+            short = quota_precheck(raw, quota, region, group) if quota is not None else None
+            if short:
+                fields = empty_probe_fields(fulfillment="InsufficientQuota", detail=short)
+            else:
+                fields = probe_once(post, url, body, sleep)
+            probe = ProbeResult(
+                region=region,
+                sku="mix" if mix else skus[0],
+                count=sum(count for _, count in group),
+                zonal=bool(zones),
+                spot=spot,
+                skus=skus,
+                **fields,
+            )
+            if probe.error:
+                label = probe_request_label(probe)
+                print(f"  ! {region}: placement probe {label} failed: {probe.error}", file=sys.stderr)
+            elif short:
+                label = probe_request_label(probe)
+                print(f"  {region}: placement probe {label} not sent — quota {short}", file=sys.stderr)
+            results.append(probe)
+    return results
+
+
+def fetch_probes_live(credential, subscription: str, regions: list[str], needs: list[tuple[str, int]], **kw):
+    return run_probes(arm_poster(credential), subscription, regions, needs, **kw)
+
+
+def probe_request_label(p: ProbeResult) -> str:
+    """'Standard_D8s_v5 x12' or 'Standard_D8s_v5+Standard_E8s_v5 x16'"""
+    return f"{'+'.join(p.skus) if p.sku == 'mix' else p.sku} x{p.count}"
+
+
+def probe_label(p: ProbeResult) -> str:
+    """Plain-English outcome: placed / insufficient capacity / insufficient quota / error / unknown,
+    with the detail appended when there is one ('insufficient quota: standardDSv5Family')."""
+    if p.error:
+        return "error"
+    label = "unknown" if p.fulfillment is None else PROBE_LABELS.get(p.fulfillment, p.fulfillment)
+    return f"{label}: {p.detail}" if p.detail else label
+
+
+def split_summary(p: ProbeResult) -> str:
+    """'1:4 2:4 3:4' (zone:count), '12' (regional), or 'Standard_D8s_v5@1:8 Standard_E8s_v5@1:4' for a mix."""
+    parts = []
+    for s in p.split:
+        cap = s.get("capacity")
+        cap_max = s.get("capacity_max")
+        count = f"{cap}-{cap_max}" if cap_max not in (None, cap) else str(cap)
+        key = "@".join(k for k in ((s.get("name") or "") if p.sku == "mix" else "", s.get("zone") or "") if k)
+        parts.append(f"{key}:{count}" if key else count)
+    return " ".join(parts)
+
+
+def pair_placement_notes(pairs: list[dict], probes: list[ProbeResult]) -> None:
+    """Annotate pair rows with what the probes say about failing over: 'pair can place X' etc.
+
+    Capacity and quota are never conflated: a quota verdict on either side is reported as
+    'quota blocks X on ...' rather than as the pair being able or unable to place."""
+    by_region: dict[str, dict[tuple, ProbeResult]] = defaultdict(dict)
+    for p in probes:
+        by_region[p.region][(p.sku, tuple(p.skus), p.count, p.spot)] = p
+    for row in pairs:
+        notes: list[str] = []
+        for key, a in by_region.get(row["region"], {}).items():
+            b = by_region.get(row["pair"] or "", {}).get(key)
+            if b is None or a.error or b.error:
+                continue
+            what = "+".join(a.skus) if a.sku == "mix" else a.sku
+            quota_side = [a.fulfillment == "InsufficientQuota", b.fulfillment == "InsufficientQuota"]
+            if all(quota_side):
+                notes.append(f"quota blocks {what} on both sides")
+            elif quota_side[0]:
+                notes.append(f"quota blocks {what} on {row['region']}")
+            elif quota_side[1]:
+                notes.append(f"quota blocks {what} on the pair")
+            elif a.fulfillment == "InsufficientCapacity" and b.fulfillment == "None":
+                notes.append(f"pair can place {what}")
+            elif a.fulfillment == "None" and b.fulfillment == "InsufficientCapacity":
+                notes.append(f"pair cannot place {what}")
+            elif a.fulfillment == "InsufficientCapacity" and b.fulfillment == "InsufficientCapacity":
+                notes.append(f"neither side can place {what}")
+        row["placement_notes"] = notes
 
 
 # --------------------------------------------------------------------------- #
@@ -560,7 +903,9 @@ def diff_against(
 # --------------------------------------------------------------------------- #
 
 
-def write_csvs(out: Path, rows: list[SkuRow], summ: list[FamilySummary], quota: list[QuotaRow]) -> None:
+def write_csvs(
+    out: Path, rows: list[SkuRow], summ: list[FamilySummary], quota: list[QuotaRow], probes: list[ProbeResult] = ()
+) -> None:
     with (out / "skus.csv").open("w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(
@@ -607,6 +952,42 @@ def write_csvs(out: Path, rows: list[SkuRow], summ: list[FamilySummary], quota: 
                 w.writerow([q.region, family_label(q.family), q.localized, q.current, q.limit, q.headroom_pct])
     else:
         (out / "quota.csv").unlink(missing_ok=True)
+    if probes:
+        with (out / "probes.csv").open("w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(
+                [
+                    "region",
+                    "sku",
+                    "count",
+                    "zonal",
+                    "spot",
+                    "score",
+                    "fulfillment",
+                    "detail",
+                    "split_summary",
+                    "error",
+                    "skus",
+                ]
+            )
+            for p in probes:
+                w.writerow(
+                    [
+                        p.region,
+                        p.sku,
+                        p.count,
+                        p.zonal,
+                        p.spot,
+                        p.score,
+                        p.fulfillment,
+                        p.detail,
+                        split_summary(p),
+                        p.error,
+                        " ".join(p.skus),
+                    ]
+                )
+    else:
+        (out / "probes.csv").unlink(missing_ok=True)
 
 
 def json_for_html(value: Any) -> str:
@@ -623,6 +1004,7 @@ def write_html(
     meta: dict,
     pairs: list[dict],
     locs: dict[str, dict],
+    probes: list[ProbeResult] = (),
 ) -> None:
     template = (Path(__file__).parent / "report_template.html").read_text(encoding="utf-8")
     report_meta = {k: v for k, v in meta.items() if not k.endswith("_fingerprint")}
@@ -635,6 +1017,7 @@ def write_html(
         "skus": [dict(asdict(r), family=family_label(r.family)) for r in rows],
         "quota": [dict(asdict(q), family=family_label(q.family), headroom_pct=q.headroom_pct) for q in quota],
         "changes": changes,
+        "probes": [asdict(p) for p in probes],
     }
     html = template.replace("/*__DATA__*/null", json_for_html(payload))
     (out / "report.html").write_text(html, encoding="utf-8")
@@ -710,13 +1093,18 @@ examples:
   azcap --regions eastus --compare out-lastweek/raw.json --out out-today
       diff against an earlier snapshot; changes appear in the report
 
+  azcap --regions eastus2,brazilsouth --zonal --need Standard_D8s_v5:12
+      ask Microsoft's Compute Recommender (preview) whether 12 x Standard_D8s_v5 would place
+      across zones in each region right now; score 0-9 and reason appear next to the restrictions
+
   azcap --regions eastus,brazilsouth --fixture fixtures/sample.json
       offline run against a saved raw.json (no Azure calls)
 
 outputs (in --out, default ./out):
-  report.html   self-contained report: heatmap, pairs, zone restrictions, quota, SKU table
+  report.html   self-contained report: heatmap, pairs, placement probes, zone restrictions, quota, SKU table
   summary.csv   region x family counts and score      skus.csv   one row per region x SKU
   pairs.csv     region vs paired region               raw.json   API snapshot; reuse with --compare/--fixture
+  probes.csv    with --need: one row per region x placement probe
 
 auth: Azure CLI login by default (any DefaultAzureCredential source works).
       az login [--tenant <id>]   then   az account list -o table   to see what you're signed into.
@@ -796,11 +1184,41 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
         help="allow a baseline from a different subscription, tenant, or incomplete region scope",
     )
     g.add_argument(
+        "--need",
+        metavar="SKU:COUNT[,SKU:COUNT...]",
+        help="placement probe: ask whether COUNT VMs of SKU would place in each region right now "
+        "(one probe per SKU per region; zones follow --zonal)",
+    )
+    g.add_argument(
+        "--need-mix",
+        action="store_true",
+        help="send all --need SKUs as one request, ranked in the order given, and let Azure pick the split",
+    )
+    g.add_argument(
+        "--os", choices=("Linux", "Windows"), default="Linux", help="OS for placement probes (default: Linux)"
+    )
+    g.add_argument("--spot", action="store_true", help="probe spot placement instead of regular")
+    g.add_argument(
+        "--probe-api-version",
+        default=PROBE_API_VERSION,
+        metavar="VER",
+        help=f"api-version for the placement probe endpoint (preview; default: {PROBE_API_VERSION})",
+    )
+    g.add_argument(
         "--fixture", metavar="RAW.JSON", help="offline: read SKU data from a saved raw.json instead of calling Azure"
     )
     g.add_argument("--out", default="out", metavar="DIR", help="output directory (default: out)")
 
     args = ap.parse_args()
+    needs: list[tuple[str, int]] = []
+    if args.need:
+        try:
+            needs = parse_need(args.need)
+        except ValueError as e:
+            ap.error(str(e))
+    if args.need_mix and not needs:
+        ap.error("--need-mix requires --need")
+    mix = args.need_mix and len(needs) > 1
 
     primaries = ordered_unique([r.strip().lower() for r in args.regions.split(",") if r.strip()])
     families = ordered_unique([f.strip() for f in args.families.split(",") if f.strip()])
@@ -813,6 +1231,7 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
         sys.exit(f"Cannot create output directory {out}: {e}")
 
     quota: list[QuotaRow] = []
+    probes: list[ProbeResult] = []
     locs: dict[str, dict] = {}
     if args.fixture:
         try:
@@ -841,8 +1260,14 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
                 if not isinstance(quota_values, list):
                     raise ValueError("'quota' must be an array")
                 quota = [QuotaRow(**q) for q in quota_values if q["region"] in regions]
+            probe_values = fx.get("probes", [])
+            if not isinstance(probe_values, list):
+                raise ValueError("'probes' must be an array")
+            probes = [ProbeResult(**pv) for pv in probe_values if pv["region"] in regions]
         except (KeyError, TypeError, ValueError) as e:
             sys.exit(f"Invalid record in fixture {args.fixture}: {e}")
+        if needs and not probes:
+            print(f"  fixture {args.fixture} has no 'probes' list — placement probes skipped", file=sys.stderr)
         fx_meta = fx.get("meta") if isinstance(fx.get("meta"), dict) else {}
         subscription = str(fx_meta.get("subscription", "fixture"))
         subinfo = {
@@ -900,6 +1325,23 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
                 quota = fetch_quota_live(credential, subscription, regions)
         except Exception as e:
             sys.exit(f"Azure request failed while collecting SKU/quota data ({type(e).__name__}): {e}")
+        if needs:
+            # Preview API: every failure is recorded per probe and never changes the restriction results.
+            print(f"Placement probes: {1 if mix else len(needs)} per region via Compute Recommender", file=sys.stderr)
+            probes = fetch_probes_live(
+                credential,
+                subscription,
+                regions,
+                needs,
+                mix=mix,
+                os_type=args.os,
+                spot=args.spot,
+                zonal=args.zonal,
+                raw=raw,
+                locs=locs,
+                api_version=args.probe_api_version,
+                quota=quota if args.include_quota else None,
+            )
 
     try:
         rows = [classify(r) for r in raw]
@@ -949,6 +1391,11 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
         "region_weighting": args.region_weighting,
         "include_quota": bool(args.include_quota),
         "compare": args.compare,
+        "need": [{"sku": sku, "count": count} for sku, count in needs],
+        "need_mix": bool(mix),
+        "probe_os": args.os,
+        "probe_spot": bool(args.spot),
+        "probe_api_version": args.probe_api_version if needs and not args.fixture else None,
     }
     summ = summarize(rows)
     changes: list[dict] = []
@@ -974,12 +1421,17 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
 
     rs = region_scores(summ, args.region_weighting)
     pairs = [] if args.no_pairs else pair_summary(primaries, locs, summ, rs)
+    pair_placement_notes(pairs, probes)
 
-    (out / "raw.json").write_text(
-        json.dumps({"meta": meta, "skus": raw, "locations": locs, "quota": [asdict(q) for q in quota]}, indent=1),
-        encoding="utf-8",
-    )
-    write_csvs(out, rows, summ, quota)
+    snapshot = {
+        "meta": meta,
+        "skus": raw,
+        "locations": locs,
+        "quota": [asdict(q) for q in quota],
+        "probes": [asdict(p) for p in probes],
+    }
+    (out / "raw.json").write_text(json.dumps(snapshot, indent=1), encoding="utf-8")
+    write_csvs(out, rows, summ, quota, probes)
     if pairs:
         with (out / "pairs.csv").open("w", encoding="utf-8", newline="") as f:
             w = csv.writer(f)
@@ -995,6 +1447,7 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
                     "pair_score",
                     "same_geography",
                     "families_constrained_both_sides",
+                    "placement_notes",
                 ]
             )
             for p in pairs:
@@ -1010,11 +1463,12 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
                         p["pair_score"],
                         p["same_geography"],
                         " ".join(p["both_constrained"]),
+                        "; ".join(p["placement_notes"]),
                     ]
                 )
     else:
         (out / "pairs.csv").unlink(missing_ok=True)
-    write_html(out, rows, summ, quota, changes, meta, pairs, locs)
+    write_html(out, rows, summ, quota, changes, meta, pairs, locs, probes)
 
     # console summary
     print(f"\nZone-adjusted % of assessed VM SKUs restricted for this subscription ({args.region_weighting}-weighted):")
@@ -1040,12 +1494,21 @@ auth: Azure CLI login by default (any DefaultAzureCredential source works).
             if not p["pair_has_data"]:
                 zonal += ", no SKUs evaluated in pair"
             both = f", both sides constrained: {' '.join(p['both_constrained'])}" if p["both_constrained"] else ""
+            placement = "".join(f", {note}" for note in p["placement_notes"])
             ps = f"{p['score']:5.1f}" if p["score"] is not None else "  n/a"
             pp = f"{p['pair_score']:5.1f}" if p["pair_score"] is not None else "  n/a"
-            print(f"  {p['region']:<22} {ps}  ->  {p['pair']:<22} {pp}  {geo}{zonal}{both}")
+            print(f"  {p['region']:<22} {ps}  ->  {p['pair']:<22} {pp}  {geo}{zonal}{both}{placement}")
+    if probes:
+        print(f"\nPlacement probes ({'spot' if args.spot else 'regular'} VMs, {args.os}; Compute Recommender preview):")
+        for p in probes:
+            scope = "zonal" if p.zonal else "regional"
+            score = f"score {p.score}" if p.score is not None else "score -"
+            tail = p.error or (f"split {split_summary(p)}" if p.split else "")
+            print(f"  {p.region:<22} {probe_request_label(p):<36} {scope:<9} {score:<8} {probe_label(p):<22} {tail}")
     if changes:
         print(f"\n{len(changes)} change(s) since baseline — see report.html")
-    print(f"\nWrote {out / 'report.html'}, {out / 'summary.csv'}, {out / 'skus.csv'}, {out / 'raw.json'}")
+    extra = f", {out / 'probes.csv'}" if probes else ""
+    print(f"\nWrote {out / 'report.html'}, {out / 'summary.csv'}, {out / 'skus.csv'}, {out / 'raw.json'}{extra}")
 
 
 if __name__ == "__main__":

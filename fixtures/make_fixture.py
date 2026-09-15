@@ -95,11 +95,48 @@ locations = {
     r: {"name": r, "display": r, "geography": g, "geography_group": gg, "pair": p, "zonal": bool(REGIONS[r][0])}
     for r, (g, gg, p) in LOCATIONS.items()
 }
+
+# Placement probes (shape of azcap.ProbeResult): 12 x Standard_D8s_v5 per region, zonal where the region has zones.
+# Score tracks the region's restriction pressure; a few regions are pinned so the demo shows every outcome
+# (brazilsouth cannot place but its pair can; westus is quota-bound; eastasia has no preview API).
+PROBE_OUTCOMES = {"brazilsouth": (2, "InsufficientCapacity", 6), "westus": (6, "InsufficientQuota", 8)}
+probes = []
+for region, (zones, p_reg, _, _) in REGIONS.items():
+    sku, count = "Standard_D8s_v5", 12
+    score, fulfillment, placed = PROBE_OUTCOMES.get(region, (max(0, 9 - round(p_reg * 40)), "None", count))
+    if score <= 2 and fulfillment == "None":
+        fulfillment, placed = "InsufficientCapacity", 4 * score
+    split = []
+    if placed:
+        buckets = zones or [None]
+        for i, zone in enumerate(buckets):
+            n = placed // len(buckets) + (1 if i < placed % len(buckets) else 0)
+            if n:
+                split.append({"name": sku, "zone": zone, "capacity": n, "capacity_max": n})
+    probes.append(
+        {
+            "region": region,
+            "sku": sku,
+            "count": count,
+            "zonal": bool(zones),
+            "spot": False,
+            "score": score if placed else None,
+            "fulfillment": fulfillment,
+            "split": split,
+            "valid_until": "2026-01-01T12:00:00Z",
+            "error": None,
+            "skus": [sku],
+        }
+    )
+# one region where the preview API is not available, to show how a failed probe renders
+probes[-1].update(score=None, fulfillment=None, split=[], valid_until=None, error="404 No registered resource provider")
+
 out = {
     "meta": {"subscription": "00000000-fixture", "generated": "synthetic"},
     "locations": locations,
     "skus": skus,
     "quota": quota,
+    "probes": probes,
 }
 Path(__file__).with_name("sample.json").write_text(json.dumps(out, indent=1), encoding="utf-8")
-print(len(skus), "skus", len(quota), "quota rows")
+print(len(skus), "skus", len(quota), "quota rows", len(probes), "probes")

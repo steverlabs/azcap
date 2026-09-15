@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "azcap"
-version = "0.2.1"
-description = "Azure VM SKU restriction scanner — zone-adjusted % of SKUs restricted per region, family, zone, and paired region"
+version = "0.3.0"
+description = "Azure VM SKU restriction scanner — zone-adjusted % of SKUs restricted per region, family, zone, and paired region, plus placement probes"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
